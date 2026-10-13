@@ -100,7 +100,7 @@ class _ExchangeResult:
     access_token: str
     token_expires_at: str
     user_id: str
-    organization_id: str
+    organization_id: str | None
     llm_provider: str
     llm_model: str
     email: str | None
@@ -125,12 +125,20 @@ def _pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-def _login_url(app_url: str, *, callback_port: int, state: str, code_challenge: str) -> str:
+def _login_url(
+    app_url: str,
+    *,
+    callback_port: int,
+    state: str,
+    code_challenge: str,
+    cli_auth_attempt_id: str | None = None,
+) -> str:
     query = urlencode(
         {
             "callback_port": callback_port,
             "state": state,
             "code_challenge": code_challenge,
+            **({"cli_auth_attempt_id": cli_auth_attempt_id} if cli_auth_attempt_id else {}),
         }
     )
     return f"{_app_endpoint(app_url, OPENSRE_ACCOUNT_LOGIN_PATH)}?{query}"
@@ -211,11 +219,22 @@ def _mapping(value: Mapping[str, object], key: str) -> Mapping[str, object]:
     return resolved
 
 
+def _organization_id(payload: Mapping[str, object]) -> str | None:
+    """Read the optional active Clerk organization from an auth response."""
+    if "organization" not in payload:
+        raise AccountAuthError("The OpenSRE app returned an invalid login response.")
+    organization = payload.get("organization")
+    if organization is None:
+        return None
+    if not isinstance(organization, Mapping):
+        raise AccountAuthError("The OpenSRE app returned an invalid login response.")
+    return _required_string(organization, "id")
+
+
 def _decode_exchange(payload: object) -> _ExchangeResult:
     if not isinstance(payload, Mapping):
         raise AccountAuthError("The OpenSRE app returned an invalid login response.")
     user = _mapping(payload, "user")
-    organization = _mapping(payload, "organization")
     llm = _mapping(payload, "llm")
     raw_email = user.get("email")
     if raw_email is not None and not isinstance(raw_email, str):
@@ -227,7 +246,7 @@ def _decode_exchange(payload: object) -> _ExchangeResult:
         access_token=_required_string(payload, "access_token"),
         token_expires_at=_required_string(payload, "expires_at"),
         user_id=_required_string(user, "id"),
-        organization_id=_required_string(organization, "id"),
+        organization_id=_organization_id(payload),
         llm_provider=llm_provider,
         llm_model=_required_string(llm, "model"),
         email=raw_email.strip() if isinstance(raw_email, str) and raw_email.strip() else None,
@@ -340,11 +359,15 @@ def login_account(
     )
     try:
         callback_port = int(server.server_address[1])
+        from infrastructure.analytics.capture import begin_cli_auth_attempt
+
+        cli_auth_attempt_id = begin_cli_auth_attempt()
         authorization_url = _login_url(
             resolved_app_url,
             callback_port=callback_port,
             state=state,
             code_challenge=challenge,
+            cli_auth_attempt_id=cli_auth_attempt_id,
         )
         opened = False
         if open_browser:
@@ -353,7 +376,9 @@ def login_account(
             finally:
                 from infrastructure.analytics.capture import capture_browser_open_requested
 
-                capture_browser_open_requested(target="account_login", opened=opened)
+                capture_browser_open_requested(
+                    target="account_login", opened=opened, cli_auth_attempt_id=cli_auth_attempt_id
+                )
         reporter.prompt_sign_in(authorization_url, opened=opened)
         callback = _wait_for_callback(server, results, timeout_seconds=timeout_seconds)
     finally:

@@ -109,7 +109,9 @@ async def test_tray_is_attached_bounded_and_keeps_selected_result_visible() -> N
         lines = _screen_lines(prompt)
         assert lines[0] == "Working"
         assert "Commands" in lines[2]
-        assert "› /integrations" in lines[3]
+        assert lines[3].startswith("│") and lines[3].endswith("│")
+        assert not lines[3].strip("│ ")
+        assert "› /integrations" in lines[4]
         assert sum("│ › /" in line or "│   /" in line for line in lines) == 6
         assert lines[-5].startswith("│") and lines[-5].endswith("│")
         assert not lines[-5].strip("│ ")
@@ -136,17 +138,124 @@ async def test_tray_is_attached_bounded_and_keeps_selected_result_visible() -> N
 
 
 @pytest.mark.asyncio
-async def test_enter_submits_the_visibly_highlighted_automatic_completion() -> None:
+async def test_enter_submits_a_command_without_subcommands() -> None:
     async with _running_prompt() as prompt:
-        _complete(prompt, "/")
+        _complete(prompt, "/ex")
         state = prompt.default_buffer.complete_state
         assert state is not None and state.complete_index is None
-        assert any("› /integrations" in line for line in _screen_lines(prompt))
+        assert any("› /exit" in line for line in _screen_lines(prompt))
 
         _press(prompt, Keys.ControlM)
 
         assert prompt.app.future is not None
-        assert prompt.app.future.result() == "/integrations"
+        assert prompt.app.future.result() == "/exit"
+
+
+@pytest.mark.asyncio
+async def test_tab_on_slash_command_opens_its_subcommand_tray() -> None:
+    async with _running_prompt() as prompt:
+        _complete(prompt, "/")
+
+        _press(prompt, Keys.Tab)
+
+        state = prompt.default_buffer.complete_state
+        assert prompt.default_buffer.text == "/integrations "
+        assert state is not None
+        assert [completion.text for completion in state.completions] == [
+            "list",
+            "setup",
+            "remove",
+            "verify",
+            "show",
+        ]
+        lines = _screen_lines(prompt)
+        assert any("› list" in line for line in lines)
+        assert any("Subcommands · /integrations" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_enter_on_a_root_command_opens_its_subcommand_tray() -> None:
+    async with _running_prompt() as prompt:
+        prompt.default_buffer.document = Document("/model", len("/model"))
+        prompt.default_buffer.complete_state = None
+
+        _press(prompt, Keys.ControlM)
+
+        state = prompt.default_buffer.complete_state
+        assert not prompt.app.is_done
+        assert prompt.default_buffer.text == "/model "
+        assert state is not None
+        assert [completion.text for completion in state.completions] == [
+            "show",
+            "set",
+            "restore",
+            "toolcall",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_enter_submits_the_selected_subcommand_from_the_continuation_tray() -> None:
+    async with _running_prompt() as prompt:
+        _complete(prompt, "/")
+        _press(prompt, Keys.Tab)
+        _press(prompt, Keys.Down)
+        _press(prompt, Keys.Down)
+
+        _press(prompt, Keys.ControlM)
+
+        assert prompt.app.future is not None
+        assert prompt.app.future.result() == "/integrations remove"
+
+
+@pytest.mark.asyncio
+async def test_rendered_cursor_tracks_character_index_after_wide_text() -> None:
+    async with _running_prompt() as prompt:
+        prompt.default_buffer.document = Document("你ab", 2)
+        _screen_lines(prompt)
+        screen = prompt.app.renderer._last_screen
+        assert screen is not None
+
+        cursor_cells = [
+            cell
+            for row in screen.data_buffer.values()
+            for cell in row.values()
+            if "class:composer-cursor" in cell.style
+        ]
+
+        assert len(cursor_cells) == 1
+        assert cursor_cells[0].char == "b"
+
+        prompt.default_buffer.cursor_position = 3
+        _screen_lines(prompt)
+        screen = prompt.app.renderer._last_screen
+        assert screen is not None
+        cursor_cells = [
+            cell
+            for row in screen.data_buffer.values()
+            for cell in row.values()
+            if "class:composer-cursor" in cell.style
+        ]
+        assert len(cursor_cells) == 1
+        assert cursor_cells[0].char == " "
+
+
+@pytest.mark.asyncio
+async def test_rendered_cursor_is_hidden_while_history_search_has_focus() -> None:
+    async with _running_prompt() as prompt:
+        _press(prompt, Keys.ControlR)
+        _screen_lines(prompt)
+        screen = prompt.app.renderer._last_screen
+        assert screen is not None
+
+        cursor_cells = [
+            cell
+            for row in screen.data_buffer.values()
+            for cell in row.values()
+            if "class:composer-cursor" in cell.style
+        ]
+
+        assert prompt.app.layout.current_control.__class__.__name__ == "SearchBufferControl"
+        assert cursor_cells == []
 
 
 @pytest.mark.asyncio
@@ -186,6 +295,18 @@ async def test_resize_and_confirmation_keep_composer_and_tray_together() -> None
         return hidden
 
     async with _running_prompt(hide_composer=_hide_composer) as prompt:
+        # A long input wraps against the live-region width. Its hidden
+        # replacement must reserve exactly the same rows or fragments remain.
+        prompt.default_buffer.text = "x" * 180
+        chrome = prompt.layout.container.children[0].content.children[0]
+        visible_composer = chrome.children[1].content
+        hidden_pad = chrome.children[2].content
+        visible_height = visible_composer.preferred_height(79, 30).preferred
+        hidden = True
+        assert hidden_pad.preferred_height(79, 30).preferred == visible_height
+        assert _screen_lines(prompt) == ["Working"]
+        hidden = False
+
         _complete(prompt, "/effort ")
         _press(prompt, Keys.Down)
         output = prompt.app.output
@@ -231,13 +352,15 @@ async def test_escape_closes_completions_before_clearing_or_cancelling(
         state = Mock()
         state.is_dispatch_running.return_value = dispatch_running
         install_session_key_bindings(prompt, build_cancel_key_bindings(state))
-        _complete(prompt, "/m")
-        prompt.default_buffer.go_to_completion(0)
+        _complete(prompt, "/mod")
+        _press(prompt, Keys.Tab)
+        assert prompt.default_buffer.text == "/model "
+        assert prompt.default_buffer.complete_state is not None
 
         _press(prompt, Keys.Escape)
 
         assert prompt.default_buffer.complete_state is None
-        assert prompt.default_buffer.text == "/m"
+        assert prompt.default_buffer.text == "/model "
         state.cancel_current_dispatch.assert_not_called()
 
         _press(prompt, Keys.Escape)
@@ -245,3 +368,55 @@ async def test_escape_closes_completions_before_clearing_or_cancelling(
             state.cancel_current_dispatch.assert_called_once()
         else:
             assert prompt.default_buffer.text == ""
+
+
+@pytest.mark.asyncio
+async def test_memory_list_is_first_submenu_choice() -> None:
+    async with _running_prompt() as prompt:
+        _complete(prompt, "/memory ")
+        state = prompt.default_buffer.complete_state
+        assert state is not None
+        assert state.completions[0].text == "list"
+        assert any("list" in line for line in _screen_lines(prompt))
+        prompt.default_buffer.go_to_completion(0)
+        _press(prompt, Keys.Tab)
+        assert prompt.default_buffer.text == "/memory list"
+
+
+@pytest.mark.asyncio
+async def test_cron_and_nested_cli_groups_select_actions_before_dispatch() -> None:
+    async with _running_prompt() as prompt:
+        buffer = prompt.default_buffer
+        buffer.document = Document("/cron", len("/cron"))
+        _press(prompt, Keys.Enter)
+        assert buffer.text == "/cron "
+        state = buffer.complete_state
+        assert state is not None
+        assert [c.text for c in state.completions] == [
+            "list",
+            "add",
+            "logs",
+            "remove",
+            "run",
+            "status",
+            "start",
+        ]
+        assert not prompt.app.is_done
+        _press(prompt, Keys.Escape)
+        assert buffer.complete_state is None
+        assert not prompt.app.is_done
+
+        _complete(prompt, "/sentry ")
+        _press(prompt, Keys.Enter)
+        assert buffer.text == "/sentry digest "
+        assert buffer.complete_state is not None
+        assert [c.text for c in buffer.complete_state.completions] == ["run", "schedule"]
+        _press(prompt, Keys.Down)
+        _press(prompt, Keys.Enter)
+        assert buffer.text == "/sentry digest schedule "
+        assert buffer.complete_state is not None
+        assert buffer.complete_state.completions[0].text == "list"
+        assert any("Subcommands · /sentry digest schedule" in row for row in _screen_lines(prompt))
+        _press(prompt, Keys.Enter)
+        assert prompt.app.is_done
+        assert prompt.app.future.result() == "/sentry digest schedule list"

@@ -2,13 +2,13 @@
 
 Contract mirrors credits metering:
   GET/POST/DELETE {OPENSRE_WEBAPP_URL}/api/agent/integrations
-  Authorization: Bearer <AGENT_USAGE_SECRET>
+  Authorization: Bearer <OPENSRE_ACCOUNT_TOKEN>  (org-scoped gateway token)
   Success: {"success": true, "data": [{id, service, status, name, credentials}, …]}
 
-All three verbs compare the bearer against the shared ``AGENT_USAGE_SECRET``
-alone, so that is the only credential this module sends. Infra wires the same
-secret into every silo: it authenticates the fleet, and ``organizationId``
-selects the tenant.
+The webapp takes the organization from the gateway token and refuses a
+request naming another one. The shared ``AGENT_USAGE_SECRET`` is sent only
+when no account token is set, and the webapp accepts it only under an
+explicit rollout opt-in.
 
 Used by the gateway when resolving integrations for Slack/Telegram turns so
 org-admins can connect GitHub (etc.) in the webapp, and to mirror a silo's own
@@ -25,12 +25,25 @@ from typing import Any
 
 import httpx
 
+from config.account import agent_bearer_token
+from config.constants.account import (
+    INTEGRATION_APP_ORIGIN,
+    INTEGRATION_IS_DEFAULT_TAG,
+    INTEGRATION_OWNER_ID_TAG,
+    INTEGRATION_OWNER_KIND_TAG,
+    INTEGRATION_RETRIEVAL_ORIGIN_FIELD,
+)
 from config.constants.billing import (
     CREDITS_HTTP_TIMEOUT_SECONDS,
-    USAGE_SECRET_ENV,
     WEBAPP_URL_ENV,
 )
+from config.constants.github import (
+    GITHUB_CONNECTION_ORIGIN_TAG,
+    GITHUB_PROVENANCE_PARAM,
+    GITHUB_UNKNOWN_ORIGIN,
+)
 from config.constants.organization import organization_id
+from integrations.credentials_api import connection_visible
 
 logger = logging.getLogger(__name__)
 
@@ -38,14 +51,13 @@ _INTEGRATIONS_PATH = "/api/agent/integrations"
 
 
 def webapp_shared_secret() -> str:
-    """The fleet secret this silo sends to the vault.
+    """The credential this silo sends to the vault.
 
-    ``/api/agent/integrations`` compares the bearer against
-    ``AGENT_USAGE_SECRET`` alone — an org-scoped machine token is a 401 there,
-    and the 401 is indistinguishable from an empty result. Returns "" when
-    unset, which leaves the vault switched off.
+    The org-scoped account token when present (the webapp takes the
+    organization from it), else the fleet secret during rollout. Returns ""
+    when neither is set, which leaves the vault switched off.
     """
-    return (os.getenv(USAGE_SECRET_ENV) or "").strip()
+    return agent_bearer_token()
 
 
 def _env(name: str) -> str:
@@ -92,6 +104,8 @@ def push_webapp_org_integration(service: str, credentials: dict[str, Any]) -> bo
     the mirror, so a failure here is logged and never fails the connect flow the
     operator is running. Returns whether the webapp accepted the change.
     """
+    if service.strip().lower() == "github":
+        return False
     target = _write_target()
     if target is None or not service.strip():
         return False
@@ -189,7 +203,7 @@ def fetch_webapp_org_integrations() -> list[dict[str, Any]] | None:
     try:
         response = httpx.get(
             url,
-            params={"organizationId": org},
+            params={"organizationId": org, GITHUB_PROVENANCE_PARAM: "1"},
             headers={"Authorization": f"Bearer {token}"},
             timeout=CREDITS_HTTP_TIMEOUT_SECONDS,
         )
@@ -210,6 +224,18 @@ def fetch_webapp_org_integrations() -> list[dict[str, Any]] | None:
         logger.warning("[webapp-vault] non-JSON response")
         return None
 
+    return records_from_vault_payload(payload, organization_id=org)
+
+
+def records_from_vault_payload(
+    payload: object, *, organization_id: str
+) -> list[dict[str, Any]] | None:
+    """Parse a vault JSON body into integration records.
+
+    ``None`` means the body is not a successful vault response. Connections
+    owned by anyone other than ``organization_id`` (a member's personal grant)
+    are dropped: this store is shared by every member the silo serves.
+    """
     if not isinstance(payload, dict) or not payload.get("success"):
         return None
     data = payload.get("data")
@@ -224,13 +250,73 @@ def fetch_webapp_org_integrations() -> list[dict[str, Any]] | None:
         credentials = item.get("credentials")
         if not service or not isinstance(credentials, dict):
             continue
+        owner_tags = _owner_tags(item)
+        if owner_tags is None:
+            continue
+        tags = _instance_tags(item, credentials, owner_tags=owner_tags)
+        if not connection_visible(tags, user_id=None, organization_id=organization_id):
+            continue
+        normalized_credentials = {
+            str(key): str(value) for key, value in credentials.items() if value is not None
+        }
+        name = str(item.get("name") or "default")
         records.append(
             {
+                INTEGRATION_RETRIEVAL_ORIGIN_FIELD: INTEGRATION_APP_ORIGIN,
                 "id": str(item.get("id") or ""),
                 "service": service,
                 "status": str(item.get("status") or "active"),
-                "name": str(item.get("name") or "default"),
-                "credentials": {str(k): str(v) for k, v in credentials.items() if v is not None},
+                "name": name,
+                "credentials": normalized_credentials,
+                "instances": [
+                    {
+                        "name": name,
+                        "tags": tags,
+                        "credentials": normalized_credentials,
+                    }
+                ],
             }
         )
     return records
+
+
+def _instance_tags(
+    item: dict[str, Any],
+    credentials: dict[object, object],
+    *,
+    owner_tags: dict[str, object],
+) -> dict[str, object]:
+    """Owner and default metadata in the v2 instance shape."""
+    tags = dict(owner_tags)
+    if item.get("service") == "github":
+        tags[GITHUB_CONNECTION_ORIGIN_TAG] = item.get(
+            GITHUB_CONNECTION_ORIGIN_TAG, GITHUB_UNKNOWN_ORIGIN
+        )
+    is_default = item.get("is_default")
+    if is_default is True or (
+        is_default is None and str(credentials.get("is_default", "")).lower() == "true"
+    ):
+        tags[INTEGRATION_IS_DEFAULT_TAG] = "true"
+    return tags
+
+
+def _owner_tags(item: dict[str, Any]) -> dict[str, object] | None:
+    """Return owner tags, preserving only absent-owner legacy records."""
+    if "owner" not in item:
+        return {}
+    owner = item["owner"]
+    if not isinstance(owner, dict):
+        return None
+    kind = owner.get("kind")
+    owner_id = owner.get("id")
+    if (
+        not isinstance(kind, str)
+        or kind not in {"user", "organization"}
+        or not isinstance(owner_id, str)
+        or not owner_id.strip()
+    ):
+        return None
+    return {
+        INTEGRATION_OWNER_KIND_TAG: kind,
+        INTEGRATION_OWNER_ID_TAG: owner_id,
+    }

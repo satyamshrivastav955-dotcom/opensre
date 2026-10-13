@@ -7,17 +7,19 @@ from collections.abc import Sequence
 from rich.console import Console
 from rich.markup import escape
 
+from config.cli_command_choices import CLI_COMMAND_CHOICES
 from surfaces.interactive_shell.command_registry.types import SlashCommand
 from surfaces.interactive_shell.runtime import Session
 from surfaces.interactive_shell.ui import ERROR
-from surfaces.interactive_shell.ui.help.help_menu import (
+from surfaces.interactive_shell.ui.help import (
     HelpSection,
-    choose_help_command,
+    browse_help_commands,
     render_command_detail,
     render_help_index,
     render_section_detail,
 )
 from surfaces.shared.terminal.components.choice_menu import repl_tty_interactive
+from surfaces.shared.terminal.components.subcommand_menu import repl_choose_subcommand
 
 QUICK_ACCESS_COMMANDS: list[str] = [
     "/integrations",
@@ -155,6 +157,31 @@ def _find_section(
     return None
 
 
+def _subcommand_options(command: SlashCommand) -> tuple[tuple[str, str], ...]:
+    """Named subcommands of ``command``, excluding ``--flag`` style completions."""
+    return tuple(
+        (name, meta) for name, meta in command.first_arg_completions if not name.startswith("-")
+    )
+
+
+def _command_text(command: SlashCommand) -> str | None:
+    """Text to dispatch for a help selection, or ``None`` when the user backs out.
+
+    A command with subcommands opens its picker first: selecting it in the
+    browser should offer the same choice the composer tray offers while typing
+    it, not silently run whichever subcommand happens to be the default.
+    """
+    path: tuple[str, ...] = (command.name,)
+    options = _subcommand_options(command)
+    while options:
+        chosen = repl_choose_subcommand(parent=" ".join(path), options=options)
+        if chosen is None:
+            return None
+        path = (*path, chosen)
+        options = CLI_COMMAND_CHOICES.get(path, ())
+    return " ".join(path)
+
+
 def _cmd_help(_session: Session, console: Console, args: list[str]) -> bool:
     sections = _help_sections()
     if args:
@@ -179,14 +206,18 @@ def _cmd_help(_session: Session, console: Console, args: list[str]) -> bool:
         return True
 
     if repl_tty_interactive():
-        selected = choose_help_command(sections)
-        if selected:
-            # Re-dispatch the selected slash command so Enter in the help picker
-            # runs the command directly instead of only opening details.
-            from surfaces.interactive_shell.command_registry import dispatch_slash
+        selected = browse_help_commands(sections)
+        if not selected:
+            return True
+        command = _find_command(sections, selected)
+        text = selected if command is None else _command_text(command)
+        if text is None:
+            return True
+        # Run the selection rather than only describing it, so Enter in the
+        # help browser is the same gesture as typing the command.
+        from surfaces.interactive_shell.command_registry import dispatch_slash
 
-            return dispatch_slash(selected, _session, console)
-        return True
+        return dispatch_slash(text, _session, console)
 
     render_help_index(console, sections)
     return True

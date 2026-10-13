@@ -1,4 +1,4 @@
-"""Owner-only, non-secret metadata for a personal OpenSRE account."""
+"""Owner-only, non-secret metadata for a Clerk-backed OpenSRE account."""
 
 from __future__ import annotations
 
@@ -23,8 +23,11 @@ from config.constants.account import (
     OPENSRE_APP_URL_ENV,
     OPENSRE_GATEWAY_LLM_MODEL_DEFAULT,
 )
-from config.constants.billing import WEBAPP_URL_ENV
+from config.constants.billing import USAGE_SECRET_ENV, WEBAPP_URL_ENV
+from config.constants.hosted_gateway import HOSTED_GATEWAY_LOOPBACK_HOSTS
+from config.constants.llm import OPENAI_API_KEY_ENV, OPENAI_BASE_URL_ENV
 from config.constants.paths import host_home
+from config.principal import Principal
 from config.secrets.store import (
     delete_secret,
     resolve_secret,
@@ -39,16 +42,23 @@ _LOCK_TIMEOUT_SECONDS = 10.0
 
 @dataclass(frozen=True)
 class AccountRecord:
-    """Non-secret identity associated with the local OpenSRE login."""
+    """Non-secret identity and active workspace for the local OpenSRE login."""
 
     user_id: str
-    organization_id: str
+    organization_id: str | None
     email: str | None
     app_url: str
     signed_in_at: str
     token_expires_at: str
     llm_provider: str = "openai"
     llm_model: str = _DEFAULT_ACCOUNT_LLM_MODEL
+
+    @property
+    def principal(self) -> Principal:
+        """Return the active integration owner without replacing user identity."""
+        if self.organization_id:
+            return Principal.org(self.organization_id)
+        return Principal.individual(self.user_id)
 
 
 @dataclass(frozen=True)
@@ -78,12 +88,33 @@ def normalize_account_app_url(value: str | None = None) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
+def is_secure_account_origin(app_url: str) -> bool:
+    """Whether the account token may be sent to ``app_url``.
+
+    True for any https origin, and for plain http only to this machine
+    (local development against ``localhost:3000``).
+    """
+    parsed = urlsplit(app_url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" and host:
+        return True
+    return parsed.scheme == "http" and host in HOSTED_GATEWAY_LOOPBACK_HOSTS
+
+
 def account_metadata_path() -> Path:
     """Return the host-owned account metadata path."""
     override = os.getenv(OPENSRE_ACCOUNT_METADATA_PATH_ENV, "").strip()
     if override:
         return Path(override).expanduser()
     return host_home() / OPENSRE_ACCOUNT_FILENAME
+
+
+def account_metadata_stamp() -> int:
+    """Return a cache stamp that changes when account scope is rewritten."""
+    try:
+        return account_metadata_path().stat().st_mtime_ns
+    except OSError:
+        return -1
 
 
 def _lock_path(path: Path) -> Path:
@@ -120,7 +151,6 @@ def _parse_record(value: object) -> AccountRecord | None:
         return None
     required = (
         "user_id",
-        "organization_id",
         "app_url",
         "signed_in_at",
         "token_expires_at",
@@ -130,13 +160,18 @@ def _parse_record(value: object) -> AccountRecord | None:
     email = value.get("email")
     if email is not None and not isinstance(email, str):
         return None
+    organization_id = value.get("organization_id")
+    if organization_id is not None and (
+        not isinstance(organization_id, str) or not organization_id.strip()
+    ):
+        return None
     llm_provider = value.get("llm_provider", "openai")
     llm_model = value.get("llm_model", "gpt-5.4-mini")
     if llm_provider != "openai" or not isinstance(llm_model, str) or not llm_model.strip():
         return None
     return AccountRecord(
         user_id=str(value["user_id"]),
-        organization_id=str(value["organization_id"]),
+        organization_id=organization_id.strip() if isinstance(organization_id, str) else None,
         email=email,
         app_url=str(value["app_url"]),
         signed_in_at=str(value["signed_in_at"]),
@@ -183,6 +218,16 @@ def resolve_account_token() -> str:
     return resolve_secret(OPENSRE_ACCOUNT_TOKEN_ENV)
 
 
+def agent_bearer_token() -> str:
+    """Bearer for gateway → webapp agent routes (vault, credits, Pipedream).
+
+    Prefers this gateway's org-scoped account token, from which the webapp takes
+    the organization. The shared fleet secret is a fallback only while
+    deployments move to the token; the webapp refuses it unless opted in.
+    """
+    return resolve_account_token() or (os.getenv(USAGE_SECRET_ENV) or "").strip()
+
+
 def stored_account_token() -> str:
     """Return the file-stored account token, ignoring any environment override."""
     return resolve_stored_secret(OPENSRE_ACCOUNT_TOKEN_ENV)
@@ -227,13 +272,28 @@ def account_llm_route() -> AccountLLMRoute | None:
     )
 
 
+def hosted_openai_env() -> dict[str, str] | None:
+    """OpenAI-compatible env for a subprocess on the hosted route, or ``None`` if unsigned."""
+    route = account_llm_route()
+    if route is None:
+        return None
+    token = resolve_account_token()
+    if not token:
+        return None
+    return {OPENAI_API_KEY_ENV: token, OPENAI_BASE_URL_ENV: route.base_url}
+
+
 __all__ = [
     "AccountRecord",
     "AccountLLMRoute",
+    "agent_bearer_token",
     "account_llm_route",
     "account_metadata_path",
+    "account_metadata_stamp",
     "delete_account_record",
     "delete_account_token",
+    "hosted_openai_env",
+    "is_secure_account_origin",
     "load_account_record",
     "normalize_account_app_url",
     "resolve_account_token",

@@ -72,8 +72,13 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         "integrations",
-        "Manage local integration credentials.",
+        "Manage integration connections.",
         "surfaces.cli.commands.integrations:integrations",
+    ),
+    CommandSpec(
+        "skills",
+        "Publish skills to every OpenSRE install and inspect the active release.",
+        "surfaces.cli.commands.skills:skills_command",
     ),
     CommandSpec(
         "runbooks",

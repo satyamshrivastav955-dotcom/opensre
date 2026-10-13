@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.tool.contracts import RegisteredTool
-from integrations.github.tools.github_cli.credentials import resolve_github_token
+from integrations.github.client import resolve_github_token
 from integrations.github.tools.github_cli.runner import build_gh_argv, denied_gh_command, run_gh
 from integrations.github.tools.github_cli.summary import summarize_gh_result
 from integrations.github.tools.github_cli.tool import (
@@ -200,6 +200,40 @@ def test_run_gh_refuses_a_json_result_the_output_cap_cut_short() -> None:
     assert result["truncated"] is True
 
 
+def test_a_graphql_query_reaches_gh_verbatim_as_one_argument() -> None:
+    """Production GraphQL parse errors: the query must not be split, quoted, or cut on the way."""
+    # Arrange: braces, quotes, newlines and $variables in one argument
+    query = (
+        "query=query($o: String!, $n: String!) {\n"
+        "  repository(owner: $o, name: $n) { pullRequests(first: 5, states: OPEN) "
+        "{ nodes { number title } } }\n}"
+    )
+    args = ["api", "graphql", "-f", query, "-f", "o=acme", "-f", "n=widgets"]
+    completed = MagicMock(returncode=0, stdout='{"data": {}}', stderr="")
+
+    # Act
+    with (
+        patch("integrations.github.tools.github_cli.runner.resolve_github_token", return_value="t"),
+        patch(
+            "integrations.github.tools.github_cli.runner.shutil.which", return_value="/usr/bin/gh"
+        ),
+        patch(
+            "integrations.github.tools.github_cli.runner.subprocess.run", return_value=completed
+        ) as run_mock,
+    ):
+        run_gh(args=args, repo="acme/widgets")
+
+    # Assert: no -R for gh api, and the query is the same single argv entry
+    assert run_mock.call_args.args[0] == ["gh", *args]
+
+
+def test_the_description_says_how_to_stay_under_the_output_cap_up_front() -> None:
+    """The model kept hitting the cut-JSON refusal; the narrowing flags belong in the contract."""
+    description = _registered(github_cli).description
+
+    assert "--jq" in description and "--limit" in description and "--json" in description
+
+
 def test_run_gh_missing_token() -> None:
     with patch("integrations.github.tools.github_cli.runner.resolve_github_token", return_value=""):
         result = run_gh(args=["issue", "list"])
@@ -265,13 +299,13 @@ def test_resolve_github_token_env_fallback_order(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("GITHUB_MCP_AUTH_TOKEN", "mcp-token")
     monkeypatch.setenv("GITHUB_TOKEN", "env-github-token")
     monkeypatch.setenv("GH_TOKEN", "env-gh-token")
-    assert resolve_github_token(None) == "mcp-token"
+    assert resolve_github_token(None) == ""
 
     monkeypatch.delenv("GITHUB_MCP_AUTH_TOKEN")
-    assert resolve_github_token(None) == "env-github-token"
+    assert resolve_github_token(None) == ""
 
     monkeypatch.delenv("GITHUB_TOKEN")
-    assert resolve_github_token(None) == "env-gh-token"
+    assert resolve_github_token(None) == ""
 
     monkeypatch.delenv("GH_TOKEN")
     assert resolve_github_token(None) == ""
@@ -283,6 +317,7 @@ def test_extract_params_maps_store_token_and_repo() -> None:
             "github": {
                 "connection_verified": True,
                 "auth_token": "store-token",
+                "connection_origin": "webapp",
                 "owner": "Tracer-Cloud",
                 "repo": "opensre",
             }
@@ -336,15 +371,15 @@ def test_run_gh_falls_back_to_env_without_source(monkeypatch: pytest.MonkeyPatch
     ):
         result = run_gh(args=["issue", "list"], github_token=None)
 
-    assert result["ok"] is True
-    assert run_mock.call_args.kwargs["env"]["GH_TOKEN"] == "env-token"
+    assert result["ok"] is False
+    run_mock.assert_not_called()
 
 
 def test_github_cli_available_with_env_token_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "env-token")
     monkeypatch.delenv("GITHUB_MCP_AUTH_TOKEN", raising=False)
 
-    assert _github_cli_available({}) is True
+    assert _github_cli_available({}) is False
 
 
 def test_github_cli_available_with_mcp_env_token_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -352,17 +387,26 @@ def test_github_cli_available_with_mcp_env_token_only(monkeypatch: pytest.Monkey
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.setenv("GITHUB_MCP_AUTH_TOKEN", "mcp-token")
 
-    assert _github_cli_available({}) is True
+    assert _github_cli_available({}) is False
 
 
-def test_github_cli_available_with_verified_source_only(
+def test_github_cli_verified_source_without_an_app_token_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_MCP_AUTH_TOKEN", raising=False)
 
-    assert _github_cli_available({"github": {"connection_verified": True}}) is True
+    assert (
+        _github_cli_available(
+            {
+                "github": {
+                    "connection_verified": True,
+                }
+            }
+        )
+        is False
+    )
     assert _github_cli_available({}) is False
 
 
@@ -384,6 +428,8 @@ def test_github_cli_runs_mutate_without_approval() -> None:
         },
     ) as run_mock:
         result = github_cli(
+            github_connection_origin="webapp",
+            github_token="app-token",
             args=["issue", "create", "--title", "t", "--body", "b"],
             repo="o/r",
         )
@@ -404,7 +450,12 @@ def test_github_cli_runs_read() -> None:
             "stderr": "",
         },
     ):
-        result = github_cli(args=["issue", "list"], repo="o/r")
+        result = github_cli(
+            github_token="app-token",
+            github_connection_origin="webapp",
+            args=["issue", "list"],
+            repo="o/r",
+        )
     assert result["ok"] is True
     assert "Open bug" in result["summary"]
 

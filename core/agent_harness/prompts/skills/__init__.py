@@ -10,27 +10,38 @@ from core.agent_harness.prompts.skills.catalog.naming import (
     is_legacy_skill_name,
     normalize_skill_name,
 )
+from core.agent_harness.prompts.skills.catalog.reader import read_skill_catalog
 from core.agent_harness.prompts.skills.catalog.registry import (
     find_action_skill,
     getting_started_skills,
     list_action_skills,
-    read_skill_catalog,
 )
 from core.agent_harness.prompts.skills.catalog.schema import parse_frontmatter
 from core.agent_harness.prompts.skills.content.body import load_skill_body
 from core.agent_harness.prompts.skills.content.cache import clear_skills_caches
 from core.agent_harness.prompts.skills.content.files import skills_dir
-from core.agent_harness.prompts.skills.content.index import load_skills_index
+from core.agent_harness.prompts.skills.content.index import (
+    load_skills_index,
+    load_skills_prompt_index,
+)
 from core.agent_harness.prompts.skills.content.references import (
     load_skill_reference,
     skill_reference_names,
+)
+from core.agent_harness.prompts.skills.snapshot import (
+    SkillCatalogSnapshot,
+    SkillSource,
+    active_skill_catalog,
 )
 
 __all__ = [
     "ActionSkill",
     "SKILLS_HEADER",
     "SkillCatalog",
+    "SkillCatalogSnapshot",
     "SkillEntryMenu",
+    "SkillSource",
+    "active_skill_catalog",
     "clear_skills_caches",
     "find_action_skill",
     "getting_started_skills",
@@ -39,6 +50,7 @@ __all__ = [
     "load_skill_body",
     "load_skill_reference",
     "load_skills_index",
+    "load_skills_prompt_index",
     "normalize_skill_name",
     "parse_frontmatter",
     "read_skill_catalog",

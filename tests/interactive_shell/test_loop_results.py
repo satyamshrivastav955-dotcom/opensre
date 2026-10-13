@@ -47,7 +47,7 @@ def _loop() -> LoopSummary:
 
 
 @pytest.mark.parametrize("width", [40, 80, 114])
-def test_compact_table_limits_rows_and_prioritizes_findings(
+def test_schedule_records_preserve_findings_and_full_report_navigation(
     width: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Rich renders "dumb" terminals at a fixed 80 columns regardless of the
@@ -77,13 +77,12 @@ def test_compact_table_limits_rows_and_prioritizes_findings(
     assert "1 fix" in text
     assert "Done" in text
     assert "Mon 08:00" in text
-    assert "hidden-id" not in text
+    assert "ID: hidden-id" in text
     assert "Report title" not in text
-    assert "slack" not in text
-    assert "0 8 * * *" not in text
-    # The data area is exactly two lines at every supported terminal width.
-    rows = [line for line in text.splitlines() if "│" in line]
-    assert len(rows) == 3  # header plus two data lines
+    assert "slack" in text
+    assert "0 8 * * *" in text
+    # Secondary fields reflow below the summary instead of squeezing table cells.
+    assert "/loops show <name-or-id>" in text
     assert all(len(line) <= width for line in text.splitlines())
 
 
@@ -183,9 +182,24 @@ def test_commands_show_latest_failure_and_allow_opening_the_earlier_full_report(
     # The opened attempt is recent enough to be in the history query; it must
     # not be listed again under its own report.
     recent = text[text.index("Recent runs") : text.index("Configuration")]
-    assert f" {prior_id} │" not in recent
-    assert f" {get_runs(task.id)[0].run_id} │" in recent
+    assert f" {prior_id} Done " not in recent
+    assert f" {get_runs(task.id)[0].run_id} Failed " in recent
     assert f"Run {prior_id} " in text
+
+
+@pytest.mark.usefixtures("loop_stores")
+def test_full_report_shows_link_urls() -> None:
+    # Arrange: a stored report that links its pull request.
+    url = "https://github.com/o/r/pull/1"
+    _stored_loop("linked-task", "Linked loop", f"Opened [PR #1]({url}).")
+    output = io.StringIO()
+    console = Console(file=output, width=100, color_system=None)
+
+    # Act
+    loops_cmds._cmd_loops(Session(), console, ["show", "Linked", "loop"])
+
+    # Assert: the report shows the URL, not only the link text.
+    assert f"Opened PR #1 ({url})." in output.getvalue()
 
 
 @pytest.mark.usefixtures("loop_stores")
@@ -217,3 +231,114 @@ def test_picker_disambiguates_duplicate_names_and_noninteractive_show_gives_a_co
     loop_show.show_loop(session, console, [])
     assert "Second report" in output.getvalue()
     assert "First report" not in output.getvalue()
+
+
+@pytest.mark.parametrize("width", [40, 80, 120])
+def test_loop_list_uses_responsive_schedule_records(
+    monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    from rich.cells import cell_len
+
+    monkeypatch.setenv("COLUMNS", str(width))
+    loop = replace(
+        _loop(), description="Fix failing checkout workflows.", next_run="2026-10-09T08:00:00Z"
+    )
+    output = io.StringIO()
+    render_loops(
+        Console(file=output, width=width),
+        [loop],
+        {},
+        now=datetime(2026, 10, 9, tzinfo=UTC),
+        local_timezone=UTC,
+    )
+    text = output.getvalue()
+    assert "ID: hidden-id" in text
+    assert "0 8 * * *" in text
+    assert "Fix failing checkout workflows." in " ".join(text.split())
+    assert "Active" in text
+    assert "Not run yet" in text
+    assert "/loops show" in text
+    assert max(cell_len(line) for line in text.splitlines()) <= width
+
+
+@pytest.mark.parametrize("width", [40, 80, 160])
+def test_recent_runs_reflow_with_full_timestamp_and_bounded_findings(
+    monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    from rich.cells import cell_len
+
+    from surfaces.interactive_shell.ui.loops import _exact_time, render_loop_details
+
+    monkeypatch.setenv("COLUMNS", str(width))
+    monkeypatch.setenv("TERM", "xterm")
+    run = TaskRun(
+        task_id="hidden-id",
+        fire_time="2026-10-09T09:00:00Z",
+        started_at="2026-10-09T09:00:00Z",
+        run_id=123456789,
+        status=TaskStatus.FAILED,
+        report_summary="[literal] " + "verified evidence " * 20 + "HIDDEN TAIL",
+    )
+    output = io.StringIO()
+    render_loop_details(Console(file=output, width=width), _loop(), [run], None)
+    text = output.getvalue()
+    recent = text[text.index("Recent runs") : text.index("Configuration")]
+    assert "123456789" in recent
+    assert _exact_time(run.started_at) in " ".join(recent.split())
+    assert "[literal]" in recent and "Failed" in recent
+    assert "\n\n    [literal] verified" in recent
+    assert "HIDDEN TAIL" not in recent and "…" in recent
+    assert "/loops show hidden-id --run" in recent
+    assert max(cell_len(line) for line in recent.splitlines()) <= width
+    if width == 40:
+        assert "Result:" in recent and "Started:" in recent
+
+
+@pytest.mark.parametrize("width", [40, 160])
+def test_invalid_loop_keeps_recovery_guidance_in_details_only(
+    monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    from surfaces.interactive_shell.ui.loops import render_loop_details
+
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setenv("COLUMNS", str(width))
+    error = "Legacy task kind 'daily_summary' was disabled. Recreate with opensre cron add."
+    loop = replace(_loop(), enabled=False, schedule_error=error)
+    output = io.StringIO()
+    console = Console(file=output, width=width, color_system=None)
+    render_loops(console, [loop], {})
+    listing = output.getvalue()
+    assert "Invalid" in listing and "Paused" in listing
+    assert "Requires action" not in listing
+    assert "daily_summary" not in listing
+    assert "/loops show <name-or-id>" in listing
+
+    output.seek(0)
+    output.truncate()
+    render_loop_details(console, loop, [], None)
+    assert error in " ".join(output.getvalue().split())
+
+
+@pytest.mark.parametrize("width", [40, 160])
+def test_loop_description_is_a_spaced_preview_with_full_details(
+    monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    from surfaces.interactive_shell.ui.loops import render_loop_details
+
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setenv("COLUMNS", str(width))
+    description = "[literal] " + "Checkout evidence " * 8 + "FULL DESCRIPTION END"
+    loop = replace(_loop(), description=description)
+    output = io.StringIO()
+    console = Console(file=output, width=width)
+    render_loops(console, [loop], {})
+    listing = output.getvalue()
+    assert "FULL DESCRIPTION END" not in listing and "…" in listing
+    assert "What it does:" not in listing
+    lines = listing.splitlines()
+    index = next(i for i, line in enumerate(lines) if "[literal]" in line)
+    assert not lines[index - 1].strip()
+    output.seek(0)
+    output.truncate()
+    render_loop_details(console, loop, [], None)
+    assert description in " ".join(output.getvalue().split())

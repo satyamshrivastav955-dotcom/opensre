@@ -7,6 +7,10 @@
 
 set -euo pipefail
 
+# Keep the optional canary credential in this shell, not in child environments.
+GITHUB_METADATA_TOKEN="${OPENSRE_INSTALL_GITHUB_TOKEN:-}"
+unset OPENSRE_INSTALL_GITHUB_TOKEN
+
 if [ -t 1 ]; then
   COLOR_RESET=$'\033[0m'
   COLOR_RED=$'\033[31m'
@@ -31,6 +35,7 @@ INSTALL_DIR="${OPENSRE_INSTALL_DIR:-}"
 INSTALL_DIR_OVERRIDE=0
 INSTALL_CHANNEL="${OPENSRE_INSTALL_CHANNEL:-main}"
 INSTALL_CHANNEL_EXPLICIT=0
+INSTALL_ORIGIN=""
 [ -n "${OPENSRE_INSTALL_CHANNEL:-}" ] && INSTALL_CHANNEL_EXPLICIT=1
 MAIN_RELEASE_TAG="${OPENSRE_MAIN_RELEASE_TAG:-main-build}"
 BIN_NAME="opensre"
@@ -135,7 +140,7 @@ run_with_dots() {
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--main] [--release] [--version <version>] [--install-dir <path>]
+Usage: install.sh [--main] [--release] [--version <version>] [--install-dir <path>] [-lp | -gh | -dc]
 
 Installs the OpenSRE CLI.
 
@@ -144,18 +149,35 @@ Options:
   --release             Install the latest versioned release instead of main.
   --version <version>   Install a specific versioned release (for example 2026.4.29).
   --install-dir <path>  Install into a specific directory.
+  -lp                   Installation command from the landing page.
+  -gh                   Installation command from the GitHub README.
+  -dc                   Installation command from the documentation.
   -h, --help            Show this help text.
 
 Examples:
   curl -fsSL https://install.opensre.com | bash
+  curl -fsSL https://install.opensre.com | bash -s -- -lp
+  curl -fsSL https://install.opensre.com | bash -s -- -gh
+  curl -fsSL https://install.opensre.com | bash -s -- -dc
   curl -fsSL https://install.opensre.com | bash -s -- --main
   curl -fsSL https://install.opensre.com | bash -s -- --version 2026.4.29
 EOF
 }
 
 parse_args() {
+  local origin
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      -lp|-gh|-dc)
+        case "$1" in
+          -lp) origin="landing_page" ;;
+          -gh) origin="github" ;;
+          -dc) origin="documentation" ;;
+        esac
+        [ -z "$INSTALL_ORIGIN" ] || [ "$INSTALL_ORIGIN" = "$origin" ] \
+          || die "Specify only one installation origin (-lp, -gh, or -dc)."
+        INSTALL_ORIGIN="$origin"
+        ;;
       --main)
         INSTALL_CHANNEL="main"
         INSTALL_CHANNEL_EXPLICIT=1
@@ -255,34 +277,165 @@ ensure_github_cli() {
 require_prerequisites() {
   need_cmd curl
   need_cmd grep
+  need_cmd mktemp
   need_cmd sed
   need_cmd tr
   need_cmd uname
 }
 
-CURL_FLAGS=(
-  --fail
-  --silent
-  --show-error
-  --location
-  --retry 3
-  --retry-delay 1
-)
+github_status_retryable() {
+  # 403/429 are GitHub's rate-limit responses from shared CI addresses.
+  # Other 4xx responses (a missing tag, for example) are final.
+  case "$1" in
+    403|408|429|500|502|503|504|000|"")
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+github_retry_after() {
+  local header_file="$1"
+  local value=""
+
+  command -v awk >/dev/null 2>&1 || return 0
+  value="$(
+    tr -d '\r' < "$header_file" \
+      | awk 'tolower($1) == "retry-after:" { wait = $2 } END { print wait }' \
+      | tr -cd '0-9'
+  )"
+  [ -n "$value" ] || return 0
+  # Ignore a non-numeric or multi-minute directive; exponential backoff still runs.
+  [ "${#value}" -le 2 ] || return 0
+  value=$((10#$value))
+  if [ "$value" -ge 1 ] && [ "$value" -le 60 ]; then
+    printf '%s\n' "$value"
+  fi
+}
+
+github_curl() {
+  local url="$1"
+  local destination="$2"
+  local http1="$3"
+  local auth_token="${4:-}"
+  shift 4
+
+  local attempt=1
+  local max_attempts=6
+  local body_file header_file http_code retry_after delay
+  local -a protocol=()
+  local -a extra=("$@")
+
+  # Release archives hit curl 92 (HTTP/2 PROTOCOL_ERROR) from GitHub.
+  # Metadata stays on curl's default HTTP version: forcing HTTP/1.1 there
+  # changes a different request class than the archive failures.
+  if [ "$http1" = "http1" ]; then
+    protocol+=(--http1.1)
+  fi
+
+  body_file="$(mktemp)"
+  header_file="$(mktemp)"
+
+  while true; do
+    # Empty arrays must stay safe with set -u on bash 3.2.
+    if [ -n "$auth_token" ]; then
+      http_code="$(
+        printf 'header = "Authorization: Bearer %s"\n' "$auth_token" |
+          curl --silent --location \
+            --connect-timeout 20 --max-time 180 \
+            ${protocol[@]+"${protocol[@]}"} \
+            -D "$header_file" \
+            -o "$body_file" \
+            -w '%{http_code}' \
+            ${extra[@]+"${extra[@]}"} \
+            --config - \
+            "$url" || true
+      )"
+    else
+      http_code="$(
+        curl --silent --location \
+          --connect-timeout 20 --max-time 180 \
+          ${protocol[@]+"${protocol[@]}"} \
+          -D "$header_file" \
+          -o "$body_file" \
+          -w '%{http_code}' \
+          ${extra[@]+"${extra[@]}"} \
+          "$url" || true
+      )"
+    fi
+    http_code="${http_code//[[:space:]]/}"
+
+    case "$http_code" in
+      200|201|204)
+        if [ -n "$destination" ]; then
+          mv "$body_file" "$destination"
+        else
+          cat "$body_file"
+          rm -f "$body_file"
+        fi
+        rm -f "$header_file"
+        return 0
+        ;;
+    esac
+
+    # An invalid canary token should fall back immediately instead of spending
+    # the public rate limit on retries with credentials GitHub will reject.
+    if [ -n "$auth_token" ] && { [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; }; then
+      rm -f "$body_file" "$header_file"
+      return 22
+    fi
+
+    if ! github_status_retryable "$http_code" || [ "$attempt" -ge "$max_attempts" ]; then
+      if [ -n "$http_code" ] && [ "$http_code" != "000" ]; then
+        printf 'curl: (22) The requested URL returned error: %s\n' "$http_code" >&2
+      else
+        printf 'curl: (56) GitHub request failed before a response\n' >&2
+      fi
+      rm -f "$body_file" "$header_file"
+      return 22
+    fi
+
+    retry_after="$(github_retry_after "$header_file")"
+    delay=$((2 ** attempt))
+    if [ "$delay" -gt 32 ]; then
+      delay=32
+    fi
+    if [ -n "$retry_after" ]; then
+      delay="$retry_after"
+    fi
+    warn "GitHub request failed (HTTP ${http_code:-transport}); retrying in ${delay}s."
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+}
 
 download_to() {
   local url="$1"
   local destination="$2"
 
-  curl "${CURL_FLAGS[@]}" -o "$destination" "$url"
+  github_curl "$url" "$destination" http1 ""
 }
 
 download_text() {
   local url="$1"
+  local github_token="${GITHUB_METADATA_TOKEN:-}"
 
-  curl "${CURL_FLAGS[@]}" \
+  if [ -n "$github_token" ]; then
+    local authenticated_response
+    if authenticated_response="$(
+      github_curl "$url" "" "" "$github_token" \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: opensre-install-script" 2>/dev/null
+    )"; then
+      printf '%s' "$authenticated_response"
+      return
+    fi
+    warn "Authenticated GitHub metadata lookup failed; retrying without credentials."
+  fi
+
+  github_curl "$url" "" "" "" \
     -H "Accept: application/vnd.github+json" \
-    -H "User-Agent: opensre-install-script" \
-    "$url"
+    -H "User-Agent: opensre-install-script"
 }
 
 fetch_release_json() {
@@ -1173,6 +1326,7 @@ record_install_analytics() {
   # ``unknown`` when no pre-install snapshot was taken: never crash under
   # ``set -u`` and never fabricate ``absent`` for an unobserved marker.
   OPENSRE_INSTALL_SOURCE="posix_installer" \
+    OPENSRE_INSTALL_ORIGIN="${INSTALL_ORIGIN:-}" \
     OPENSRE_INSTALL_MARKER_STATE="${install_marker_state:-unknown}" \
     OPENSRE_INSTALL_CHANNEL="$INSTALL_CHANNEL" \
     OPENSRE_INSTALL_VERSION="$installed_version" \

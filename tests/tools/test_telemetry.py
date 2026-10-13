@@ -119,6 +119,106 @@ class ToolFailureCase:
     expected_source: str
 
 
+def _ci_repair_demo_case(tool_name: str) -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from integrations.github.tools.ci_repair_demo import cleanup
+        from integrations.github.tools.ci_repair_demo import tool as mod
+
+        if tool_name == "seed_ci_repair_demo":
+            mp.setattr(mod, "configured_token", lambda _token: "token")
+            client = MagicMock()
+            client.request.side_effect = RuntimeError("github down")
+            mp.setattr(mod, "GitHubRestClient", lambda _token: client)
+            return
+        mp.setattr(cleanup, "results_directory", lambda: Path(tempfile.mkdtemp()))
+        mp.setattr(mod, "remove_task", MagicMock(side_effect=RuntimeError("storage unavailable")))
+
+    def invoke() -> dict[str, Any]:
+        from integrations.github.tools.ci_repair_demo import tool as mod
+
+        if tool_name == "seed_ci_repair_demo":
+            return mod.seed_ci_repair_demo(
+                github_connection_origin="webapp",
+                github_token="app-token",
+                owner="octocat",
+                repo="opensre-ci-repair-demo",
+            )
+        return mod.finish_ci_repair_demo(
+            github_connection_origin="webapp",
+            github_token="app-token",
+            repo="octocat/opensre-ci-repair-demo",
+            pr_number=1,
+            loop_id="abc",
+            outcome="failed",
+        )
+
+    return ToolFailureCase(tool_name, patch, invoke, tool_name, "github")
+
+
+def _probe_github_repair_access_case() -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        from integrations.github.tools.repair_access import tool as mod
+
+        def _token(_explicit: str | None) -> str:
+            return "token"
+
+        client = MagicMock()
+        client.request_with_headers.side_effect = RuntimeError("github down")
+
+        def _client(_token_value: str) -> MagicMock:
+            return client
+
+        mp.setattr(mod, "configured_token", _token)
+        mp.setattr(mod, "GitHubRestClient", _client)
+
+    def invoke() -> dict[str, Any]:
+        from integrations.github.tools.repair_access import tool as mod
+
+        return mod.probe_github_repair_access(
+            github_connection_origin="webapp",
+            github_token="app-token",
+        )
+
+    return ToolFailureCase(
+        "probe_github_repair_access",
+        patch,
+        invoke,
+        "probe_github_repair_access",
+        "github",
+    )
+
+
+def _run_ci_repair_demo_case() -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        from integrations.github.tools.ci_repair_run import tool as mod
+
+        def _seed(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("seed down")
+
+        mp.setattr(mod, "seed_ci_repair_demo", _seed)
+
+    def invoke() -> dict[str, Any]:
+        from integrations.github.tools.ci_repair_run import tool as mod
+
+        return mod.run_ci_repair_demo(
+            github_connection_origin="webapp",
+            github_token="app-token",
+            owner="octocat",
+            repo="opensre-ci-repair-demo",
+        )
+
+    return ToolFailureCase(
+        "run_ci_repair_demo",
+        patch,
+        invoke,
+        "run_ci_repair_demo",
+        "github",
+    )
+
+
 def _ci_repair_case(tool_name: str) -> ToolFailureCase:
     def patch(mp: pytest.MonkeyPatch) -> None:
         from integrations.github.tools.ci_repair_loop import tool as mod
@@ -129,8 +229,16 @@ def _ci_repair_case(tool_name: str) -> ToolFailureCase:
         from integrations.github.tools.ci_repair_loop import tool as mod
 
         if tool_name == "schedule_ci_repair_loop":
-            return mod.schedule_ci_repair_loop(demo=True)
-        return mod.get_ci_repair_loop(task_id="a" * 12)
+            return mod.schedule_ci_repair_loop(
+                github_connection_origin="webapp",
+                github_token="app-token",
+                owner="octocat",
+                repo="service",
+                pr_number=1,
+            )
+        return mod.get_ci_repair_loop(
+            github_connection_origin="webapp", github_token="app-token", task_id="a" * 12
+        )
 
     return ToolFailureCase(tool_name, patch, invoke, tool_name, "github")
 
@@ -282,7 +390,9 @@ def _github_repository_case() -> ToolFailureCase:
     def invoke() -> dict[str, Any]:
         from integrations.github.tools.repository import get_github_repository
 
-        return get_github_repository(owner="o", repo="r", github_token="tok")
+        return get_github_repository(
+            github_connection_origin="webapp", owner="o", repo="r", github_token="tok"
+        )
 
     return ToolFailureCase(
         "github_repository",
@@ -310,7 +420,9 @@ def _github_star_history_case() -> ToolFailureCase:
     def invoke() -> dict[str, Any]:
         from integrations.github.tools.stargazers import get_github_star_history
 
-        return get_github_star_history(owner="o", repo="r", github_token="tok")
+        return get_github_star_history(
+            github_connection_origin="webapp", owner="o", repo="r", github_token="tok"
+        )
 
     return ToolFailureCase(
         "github_star_history",
@@ -331,7 +443,9 @@ def _github_ci_analytics_case() -> ToolFailureCase:
     def invoke() -> dict[str, Any]:
         from integrations.github.tools.ci_analytics.tool import analyze_github_ci_reliability
 
-        return analyze_github_ci_reliability(owner="o", repo="r", github_token="tok")
+        return analyze_github_ci_reliability(
+            github_connection_origin="webapp", owner="o", repo="r", github_token="tok"
+        )
 
     return ToolFailureCase(
         "github_ci_analytics",
@@ -352,7 +466,9 @@ def _github_ci_health_scan_case() -> ToolFailureCase:
     def invoke() -> dict[str, Any]:
         from integrations.github.tools.ci_health_scan.tool import scan_github_ci_health
 
-        return scan_github_ci_health(owners=["o"], github_token="tok")
+        return scan_github_ci_health(
+            github_connection_origin="webapp", owners=["o"], github_token="tok"
+        )
 
     return ToolFailureCase(
         "github_ci_health_scan",
@@ -360,6 +476,32 @@ def _github_ci_health_scan_case() -> ToolFailureCase:
         invoke,
         "scan_github_ci_health",
         "github",
+    )
+
+
+def _local_repo_insights_case() -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        from pathlib import Path
+
+        from tools.system.local_repo_insights import analysis as mod
+
+        def one_checkout(*_args: Any, **_kwargs: Any) -> Any:
+            return mod._Candidates(checkouts=(Path("checkout"),))
+
+        mp.setattr(mod, "_candidates", one_checkout)
+        mp.setattr(mod, "collect_repo", MagicMock(side_effect=RuntimeError("git")))
+
+    def invoke() -> dict[str, Any]:
+        from tools.system.local_repo_insights.tool import analyze_local_repositories
+
+        return analyze_local_repositories(reason="requested")
+
+    return ToolFailureCase(
+        "local_repo_insights",
+        patch,
+        invoke,
+        "analyze_local_repositories",
+        "system",
     )
 
 
@@ -734,6 +876,56 @@ def _x_mcp_call_tool_case() -> ToolFailureCase:
     )
 
 
+def _pipedream_source() -> dict[str, Any]:
+    return {
+        "access_mode": "webapp_proxy",
+        "apps": [{"service": "notion", "app_slug": "notion", "account_id": "acc"}],
+    }
+
+
+def _patch_pipedream_proxy_runtime(mp: pytest.MonkeyPatch, failing: str) -> None:
+    """Force the webapp proxy call the tool reports."""
+    from integrations.pipedream.tools.pipedream_tool import tool as mod
+
+    mp.setattr(mod, failing, MagicMock(side_effect=RuntimeError("mcp")))
+
+
+def _pipedream_list_case() -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        _patch_pipedream_proxy_runtime(mp, "list_proxy_tools")
+
+    def invoke() -> dict[str, Any]:
+        from integrations.pipedream.tools.pipedream_tool import list_pipedream_tools
+
+        return list_pipedream_tools(pipedream=_pipedream_source())
+
+    return ToolFailureCase(
+        "pipedream_list_tools",
+        patch,
+        invoke,
+        "list_pipedream_tools",
+        "pipedream",
+    )
+
+
+def _pipedream_call_tool_case() -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        _patch_pipedream_proxy_runtime(mp, "call_proxy_tool")
+
+    def invoke() -> dict[str, Any]:
+        from integrations.pipedream.tools.pipedream_tool import call_pipedream_tool
+
+        return call_pipedream_tool(tool_name="search", pipedream=_pipedream_source())
+
+    return ToolFailureCase(
+        "pipedream_call_tool",
+        patch,
+        invoke,
+        "call_pipedream_tool",
+        "pipedream",
+    )
+
+
 def _runbook_guidance_case() -> ToolFailureCase:
     def patch(mp: pytest.MonkeyPatch) -> None:
         from tools.system.runbook_guidance_tool import tool as mod
@@ -777,10 +969,13 @@ def _hosted_gateway_case(tool_name: str) -> ToolFailureCase:
             gateway_health,
             gateway_lifecycle,
             gateway_prompt,
+            gateway_prompt_cancel,
         )
 
         if tool_name == "ask_hosted_gateway":
             return gateway_prompt.ask_hosted_gateway(prompt="which tasks run?")
+        if tool_name == "cancel_hosted_gateway_prompt":
+            return gateway_prompt_cancel.cancel_hosted_gateway_prompt(prompt_id="p_" + "a" * 32)
         tools = {
             "check_hosted_gateway": gateway_health.check_hosted_gateway,
             "start_hosted_gateway": gateway_lifecycle.start_hosted_gateway,
@@ -797,8 +992,13 @@ _TOOL_FAILURE_CASES: list[ToolFailureCase] = [
     _hosted_gateway_case("start_hosted_gateway"),
     _hosted_gateway_case("stop_hosted_gateway"),
     _hosted_gateway_case("ask_hosted_gateway"),
+    _hosted_gateway_case("cancel_hosted_gateway_prompt"),
     _ci_repair_case("schedule_ci_repair_loop"),
     _ci_repair_case("get_ci_repair_loop"),
+    _ci_repair_demo_case("seed_ci_repair_demo"),
+    _ci_repair_demo_case("finish_ci_repair_demo"),
+    _probe_github_repair_access_case(),
+    _run_ci_repair_demo_case(),
     _openobserve_case(),
     _snowflake_case(),
     _cloudwatch_logs_case(),
@@ -818,13 +1018,18 @@ _TOOL_FAILURE_CASES: list[ToolFailureCase] = [
     _eks_list_deployments_case(),
     _eks_list_pods_case(),
     _eks_pod_logs_case(),
+    _pipedream_list_case(),
+    _pipedream_call_tool_case(),
     _posthog_mcp_list_case(),
     _posthog_mcp_call_tool_case(),
     _sentry_mcp_list_case(),
     _sentry_mcp_call_tool_case(),
     _x_mcp_list_case(),
     _x_mcp_call_tool_case(),
+    _pipedream_list_case(),
+    _pipedream_call_tool_case(),
     _runbook_guidance_case(),
+    _local_repo_insights_case(),
 ]
 
 
@@ -999,13 +1204,21 @@ _MIGRATED_TOOL_NAMES: frozenset[str] = frozenset(
         "get_github_repository",
         "get_github_star_history",
         "analyze_github_ci_reliability",
+        # analyze_local_repositories reports a checkout it could not read as a
+        # warning and goes on with the others.
+        "analyze_local_repositories",
         "scan_github_ci_health",
         "schedule_ci_repair_loop",
         "get_ci_repair_loop",
+        "seed_ci_repair_demo",
+        "finish_ci_repair_demo",
+        "probe_github_repair_access",
+        "run_ci_repair_demo",
         "check_hosted_gateway",
         "start_hosted_gateway",
         "stop_hosted_gateway",
         "ask_hosted_gateway",
+        "cancel_hosted_gateway_prompt",
         # EKS — enumerated in #1463
         "list_eks_clusters",
         "describe_eks_cluster",
@@ -1021,6 +1234,9 @@ _MIGRATED_TOOL_NAMES: frozenset[str] = frozenset(
         # PostHog MCP — both swallow sites in PostHogMCPTool/__init__.py.
         "list_posthog_tools",
         "call_posthog_tool",
+        # Pipedream proxy — both swallow sites in pipedream_tool/tool.py.
+        "list_pipedream_tools",
+        "call_pipedream_tool",
         # Sentry MCP — both swallow sites in SentryMCPTool/__init__.py.
         "list_sentry_tools",
         "call_sentry_tool",
@@ -1052,6 +1268,9 @@ _TOOLS_WITHOUT_DELIBERATE_CATCH: frozenset[str] = frozenset(
         # unknown key); a parser failure it did not anticipate reaches the
         # global wrapper.
         "read_structured_file",
+        # list_scheduled_loops reads the local task store and lets any store
+        # error reach the global wrapper.
+        "list_scheduled_loops",
         # scan_local_git_workspace shells out to git per repository and lets
         # anything unexpected reach the global wrapper.
         "scan_local_git_workspace",
@@ -1262,7 +1481,6 @@ _TOOLS_WITHOUT_DELIBERATE_CATCH: frozenset[str] = frozenset(
         "read_yc_db_logs",
         "read_yc_logs",
         "query_yc_metrics",
-        "redeploy_railway_service",
         "replay_slack_thread_locally",
         "scan_redis_keys",
         "search_bitbucket_code",

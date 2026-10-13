@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import shlex
+
+from config.command_inputs import needs_command_input
 from surfaces.interactive_shell.session import Session
 from surfaces.shared.terminal.components.choice_menu import repl_tty_interactive
 
@@ -19,8 +22,12 @@ def _literal_slash_command_text(text: str) -> str | None:
 
 
 _EXCLUSIVE_STDIN_MENU_COMMANDS: frozenset[str] = frozenset(
+    {"/history", "/memory", "/loops", "/work", "/fleet"}
+)
+# These commands can print tables or open a picker even with arguments.
+# Reserve the whole command family so aliases and help topics stay covered.
+_EXCLUSIVE_STDIN_COMMANDS: frozenset[str] = frozenset(
     {
-        "/history",
         "/account",
         "/auth",
         # ``/choose`` renders the pending ask_user_choice arrow-key picker (raw
@@ -29,9 +36,6 @@ _EXCLUSIVE_STDIN_MENU_COMMANDS: frozenset[str] = frozenset(
         # ``/demo`` queues onboarding; finish it before reading the queued prompt.
         "/demo",
         "/help",
-        "/integrations",
-        "/mcp",
-        "/memory",
         "/model",
         "/tools",
         "/trust",
@@ -45,14 +49,12 @@ _EXCLUSIVE_STDIN_MENU_COMMANDS: frozenset[str] = frozenset(
         "/verify",
         "/status",
         "/cost",
+        "/cron",
         "/credits",
         "/tasks",
-        "/loops",
-        "/work",
         "/alerts",
         "/privacy",
         "/context",
-        "/fleet",
         "/compact",
         "/sessions",
         "/resume",
@@ -62,13 +64,26 @@ _EXCLUSIVE_STDIN_MENU_COMMANDS: frozenset[str] = frozenset(
 )
 _EXCLUSIVE_STDIN_SUBCOMMANDS: frozenset[tuple[str, str]] = frozenset(
     {
+        ("/integrations", "list"),
+        ("/integrations", "show"),
+        ("/integrations", "verify"),
         ("/integrations", "setup"),
         # ``remove`` drives a native inline arrow-key picker (raw os.read on
         # stdin). Without exclusive stdin the active prompt application steals
         # keystrokes and CPR responses leak into the next prompt buffer.
         ("/integrations", "remove"),
+        ("/memory", "list"),
+        ("/mcp", "list"),
         ("/mcp", "connect"),
         ("/mcp", "disconnect"),
+        ("/work", "list"),
+        ("/work", "ls"),
+        ("/work", "next"),
+        ("/work", "prioritize"),
+        # Retention asks for a missing value; show prints a history table.
+        ("/history", "retention"),
+        ("/history", "show"),
+        ("/fleet", "budget"),
         ("/loops", "active"),
         ("/loops", "all"),
         ("/loops", "inbox"),
@@ -89,6 +104,7 @@ _WAIT_FOR_COMPLETION_COMMANDS: frozenset[str] = frozenset(
         "/credits",
         "/auth",
         "/login",
+        "/logout",
         # ``/goal set|resume`` queues the condition as the next prompt turn.
         # Wait for the slash turn to finish so the work prompt renders as its
         # own ``[N] ❯`` line (not buried under the set paint / ``$`` echo).
@@ -119,13 +135,22 @@ def turn_needs_exclusive_stdin(text: str, _session: Session) -> bool:
     if dispatch_text is None:
         return False
 
-    parts = dispatch_text.split()
+    try:
+        parts = shlex.split(dispatch_text)
+    except ValueError:
+        parts = dispatch_text.split()
     if not parts:
         return False
+    if needs_command_input(parts[0], parts[1:]):
+        return True
     name = parts[0].lower()
     args = [arg.lower() for arg in parts[1:]]
 
-    if name in _WAIT_FOR_COMPLETION_COMMANDS:
+    # Long ticks keep running after their short foreground reply window. Keep
+    # the prompt's cancel keys available while waiting; bare run opens editing.
+    if name == "/cron" and len(args) >= 2 and args[0] == "run" and "--help" not in args:
+        return False
+    if name in _WAIT_FOR_COMPLETION_COMMANDS or name in _EXCLUSIVE_STDIN_COMMANDS:
         return True
     if name == "/theme":
         return True

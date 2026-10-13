@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from config.constants.ci_repair import CI_REPAIR_REPORT_BUILDER
 from config.constants.scheduler import WEEKDAY_CRON_FIELD
+from config.scope_handoff import acting_scope
 from core.agent_harness import pin_recurring_skill
 from infrastructure.scheduling.scheduler.credentials import (
     resolve_slack_credentials,
@@ -18,6 +20,7 @@ from infrastructure.scheduling.scheduler.credentials import (
     resolve_telegram_credentials,
     resolve_telegram_default_chat_id,
 )
+from infrastructure.scheduling.scheduler.cron_expression import cap_cron_at_most_hourly
 from infrastructure.scheduling.scheduler.loop_constants import (
     LOOP_CHANNELS_PARAM,
     LOOP_CREATED_BY_PARAM,
@@ -34,8 +37,15 @@ from infrastructure.scheduling.scheduler.loop_constants import (
     LOOP_SLACK_CHAT_ID_PARAM,
     LOOP_SLUG_PARAM,
     LOOP_SOURCE_PARAM,
+    LOOP_STATUS_ACTIVE,
+    LOOP_STATUS_DRAFT,
+    LOOP_STATUS_PAUSED,
     LOOP_TELEGRAM_CHAT_ID_PARAM,
     LOOP_TIME_PARAM,
+)
+from infrastructure.scheduling.scheduler.loop_prompt import (
+    current_loop_description,
+    current_loop_prompt,
 )
 from infrastructure.scheduling.scheduler.operation_log import (
     record_scheduler_loop_operation,
@@ -120,7 +130,10 @@ class LoopSummary:
 
     @property
     def status(self) -> str:
-        return "active" if self.enabled else "draft"
+        """Active while enabled; a disabled loop that has run is paused, one that never ran a draft."""
+        if self.enabled:
+            return LOOP_STATUS_ACTIVE
+        return LOOP_STATUS_PAUSED if self.last_run else LOOP_STATUS_DRAFT
 
     @property
     def time(self) -> str:
@@ -196,7 +209,7 @@ def loop_name(task: ScheduledTask) -> str:
 
 def loop_description(task: ScheduledTask) -> str:
     """Return optional loop description metadata."""
-    return task.params.get(LOOP_DESCRIPTION_PARAM, "").strip()
+    return current_loop_description(task.params)
 
 
 def loop_channels(task: ScheduledTask) -> tuple[Provider, ...]:
@@ -346,6 +359,8 @@ def create_manual_loop(
         if not time_text.strip():
             raise ValueError("time is required unless --cron is provided")
         cron_expr = cron_for_time(time_text, weekdays=weekdays)
+    if report.strip() != CI_REPAIR_REPORT_BUILDER:
+        cron_expr = cap_cron_at_most_hourly(cron_expr, timezone.strip() or "UTC")
 
     channel_providers = normalize_loop_channels(
         channels,
@@ -356,11 +371,13 @@ def create_manual_loop(
     params = {
         LOOP_GROUP_ID_PARAM: loop_id,
         LOOP_SOURCE_PARAM: _MANUAL_LOOP_SOURCE,
-        LOOP_CREATED_BY_PARAM: _MANUAL_LOOP_CREATED_BY,
         LOOP_PROMPT_PARAM: loop_prompt,
         LOOP_DESCRIPTION_PARAM: _description_from_prompt(loop_prompt),
         LOOP_CHANNELS_PARAM: ",".join(provider.value for provider in channel_providers),
     }
+    if acting_scope() is None:
+        # In an organization's turn the store records the member who acted instead.
+        params[LOOP_CREATED_BY_PARAM] = _MANUAL_LOOP_CREATED_BY
     time_label = loop_time_label(cron_expr)
     if time_label:
         params[LOOP_TIME_PARAM] = time_label
@@ -413,24 +430,35 @@ def summarize_loop(
     return _summarize_group((task,), now=now)
 
 
+def summarize_loops(
+    tasks: Sequence[ScheduledTask],
+    *,
+    include_disabled: bool = True,
+    now: datetime | None = None,
+) -> list[LoopSummary]:
+    """Group already-loaded tasks into loops, sorted with active loops first."""
+    task_groups: dict[str, list[ScheduledTask]] = {}
+    for task in tasks:
+        if not include_disabled and not task.enabled:
+            continue
+        task_groups.setdefault(_loop_group_id(task), []).append(task)
+
+    summaries = [_summarize_group(tuple(group), now=now) for group in task_groups.values()]
+    return sorted(
+        summaries,
+        key=lambda loop: (not loop.enabled, loop.name.casefold(), loop.id),
+    )
+
+
 def list_loop_summaries(
     *,
     include_disabled: bool = True,
     store_path: Path | None = None,
     now: datetime | None = None,
 ) -> list[LoopSummary]:
-    """Return configured loops, sorted with active loops first."""
-    task_groups: dict[str, list[ScheduledTask]] = {}
-    for task in list_tasks(store_path):
-        if not include_disabled and not task.enabled:
-            continue
-        task_groups.setdefault(_loop_group_id(task), []).append(task)
-
-    summaries = [_summarize_group(tuple(tasks), now=now) for tasks in task_groups.values()]
-    return sorted(
-        summaries,
-        key=lambda loop: (not loop.enabled, loop.name.casefold(), loop.id),
-    )
+    """Return configured loops from the store, sorted with active loops first."""
+    tasks = list_tasks(store_path)
+    return summarize_loops(tasks, include_disabled=include_disabled, now=now)
 
 
 def resolve_loop_summary(
@@ -662,7 +690,7 @@ def _summarize_group(
         task_ids=tuple(task.id for task in tasks),
         name=loop_name(representative),
         description=loop_description(representative),
-        prompt=representative.params.get(LOOP_PROMPT_PARAM, "").strip(),
+        prompt=current_loop_prompt(representative.params),
         kind=representative.kind,
         cron=representative.cron,
         timezone=representative.timezone,
@@ -775,6 +803,7 @@ __all__ = [
     "default_loop_channels",
     "delete_loop",
     "list_loop_summaries",
+    "summarize_loops",
     "loop_channels",
     "loop_description",
     "loop_name",

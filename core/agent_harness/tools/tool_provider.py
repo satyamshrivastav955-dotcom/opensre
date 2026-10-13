@@ -6,6 +6,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from config.constants.memory import MEMORY_TOOL_NAMES
 from core.agent_harness.ports import (
     CancelCapableConsole,
     ConfirmFn,
@@ -16,6 +17,7 @@ from core.agent_harness.ports import (
     ToolEventObserver,
 )
 from core.agent_harness.tools.action_tools import get_action_tools_from_integrations_view
+from core.agent_harness.tools.progressive_tool_catalog import ProgressiveToolCatalog
 from core.agent_harness.tools.skill_tool_catalog import SkillToolCatalog
 from core.agent_harness.tools.tool_context import (
     ACTION_TOOL_CONTEXT_RESOURCE_KEY,
@@ -154,9 +156,24 @@ class DefaultToolProvider:
             tools = get_action_tools_from_integrations_view(ctx, resolved_integrations=resolved)
         if not getattr(self._session, "skill_discovery_enabled", True):
             tools = [tool for tool in tools if tool.name != "skill_view"]
+        if not getattr(self._session, "long_term_memory_enabled", True):
+            tools = [tool for tool in tools if tool.name not in MEMORY_TOOL_NAMES]
         if self._unattended:
             tools = [tool for tool in tools if tool_allowed_for_unattended_run(tool)]
-        catalog = SkillToolCatalog(self._session, tools, enabled=not self._unattended)
+        skill_catalog = SkillToolCatalog(self._session, tools, enabled=not self._unattended)
+        request_names: tuple[str, ...] = ()
+        if not self._unattended:
+            from core.agent_harness.turns.literal_command import bang_shell_command
+
+            if bang_shell_command(turn_user_message) is not None:
+                request_names = ("shell_run",)
+        catalog = ProgressiveToolCatalog(
+            self._session,
+            skill_catalog.snapshot,
+            enabled=not self._unattended and self._precomputed_action_tools is None,
+            base_names=(tool.name for tool in tools),
+            request_names=request_names,
+        )
         self._live_catalog = LiveToolCatalog(catalog.snapshot)
         return list(catalog.snapshot())
 

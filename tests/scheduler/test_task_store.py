@@ -750,6 +750,7 @@ class TestLegacyTaskMigration:
             "timezone": "Asia/Kolkata",
             "provider": "interactive_shell",
             "chat_id": "local-session",
+            "organization": "",
             "window_hours": 12,
             "enabled": True,
             "params": {

@@ -34,7 +34,7 @@ def test_a_tool_guidance_name_is_answered_as_already_loaded_not_as_a_failure() -
     assert result["ok"] is True
     assert result["already_loaded"] is True
     assert "summarize_github_pr_status" in result["tools"]
-    assert "call the tool that fits the request" in result["content"]
+    assert "tracking-github-work-status" in result["content"].lower()
     assert "error" not in result
 
 
@@ -43,6 +43,15 @@ def test_skill_view_unknown_name_lists_available() -> None:
     assert result["ok"] is False
     assert "delivering-morning-briefings" in result["available"]
     assert "repair-github-ci" in result["available"]
+
+
+def test_skill_view_search_finds_workflow_without_loading_its_body() -> None:
+    result = execute_skill_view_tool({"query": "fix GitHub security alerts"}, ctx=None)  # type: ignore[arg-type]
+
+    assert result["ok"] is True
+    assert result["matches"][0]["name"] == "fixing-github-security-alerts"
+    assert "content" not in result
+    assert "Load the best matching workflow" in result["summary"]
 
 
 class _SessionStub:

@@ -13,17 +13,8 @@ from typing import Any
 
 from core.agent_harness import SessionCore, SessionManager
 from core.agent_harness.spi.handoff import AskUserQuestion, format_ask_user_answers, question_key
-from core.agent_harness.spi.session_state import PendingUserChoice, withhold_capabilities
-
-#: Capabilities an unattended turn never has: nothing interactive, nothing that switches
-#: the runtime, and no CLI subprocess, whose output only a terminal could show.
-UNATTENDED_DISABLED_CAPABILITIES = (
-    "cli_commands",
-    "hosted_gateway",
-    "llm_provider",
-    "slash_commands",
-    "task_cancel",
-)
+from core.agent_harness.spi.prompt_chrome import is_literal_command
+from core.agent_harness.spi.session_state import PendingUserChoice
 
 APPROVE_OPTION = "Approve"
 DENY_OPTION = "Deny"
@@ -37,21 +28,40 @@ class AnswerRejected(ValueError):
 
 
 class UnattendedSessions:
-    """Opens one fresh session per unattended turn, or resumes one that stopped to ask."""
+    """Owns unattended sessions and actor-scoped hosted conversation continuity."""
 
     def __init__(self, manager: SessionManager | None = None) -> None:
         self._manager = manager or SessionManager()
 
     def open(self) -> SessionCore:
         session = self._manager.create(persistent_tasks=False, warm_integrations=False)
-        restrict_to_unattended(session)
+        prepare_unattended_session(session)
+        return session
+
+    def hosted_conversation(self) -> str | None:
+        """The bound actor's own conversation id, when that conversation still exists."""
+        existing = hosted_conversation_id()
+        if existing is not None and self._manager.has_session(existing):
+            return existing
+        return None
+
+    def open_hosted_conversation(self) -> SessionCore:
+        """Open a new conversation and make it the bound actor's own."""
+        session = self.open()
+        _remember_hosted_conversation(session.session_id)
         return session
 
     def resume(self, session_id: str) -> SessionCore:
-        """Reload a persisted session; capabilities are not stored, so restrict it again."""
+        """Reload a persisted session and restore deferred questions."""
         session = self._manager.resolve(session_id, warm_integrations=False, persistent_tasks=False)
-        restrict_to_unattended(session)
+        prepare_unattended_session(session)
         return session
+
+    def resume_conversation(self, session_id: str) -> SessionCore | None:
+        """Resume one of the bound actor's conversations; ``None`` when it has no such session."""
+        if not self._manager.has_session(session_id):
+            return None
+        return self.resume(session_id)
 
     def flush(self, session: SessionCore) -> None:
         """Persist the session's state now, so a reload during the turn sees it."""
@@ -61,25 +71,102 @@ class UnattendedSessions:
         self._manager.close(session, wait_for_memory_extraction=False)
 
 
-def restrict_to_unattended(session: SessionCore) -> None:
+def hosted_conversation_id() -> str | None:
+    """The bound actor's own conversation id as stored; it may name a deleted session."""
+    from config.constants.paths import session_home
+
+    path = session_home() / "hosted-conversation"
+    try:
+        session_id = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return session_id or None
+
+
+def _remember_hosted_conversation(session_id: str) -> None:
+    """Record the actor's conversation id on the same volume as the transcript."""
+    import os
+    import tempfile
+
+    from config.constants.paths import session_home
+
+    path = session_home() / "hosted-conversation"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".hosted-conversation-")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(session_id + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        from pathlib import Path
+
+        Path(temporary).unlink(missing_ok=True)
+
+
+def prepare_unattended_session(session: SessionCore) -> None:
     """A question ends the turn as a pending choice instead of waiting for an answer."""
-    withhold_capabilities(session, *UNATTENDED_DISABLED_CAPABILITIES)
     session.available_capabilities["ask_user_choice"] = ("deferred",)
 
 
-def invocation_key(tool_name: str, arguments: Mapping[str, Any]) -> str:
-    """Names one exact tool call: the tool plus a digest of its arguments."""
-    canonical = json.dumps(arguments, sort_keys=True, default=str, ensure_ascii=False)
+def prompt_with_facts(prompt: str, facts: Mapping[str, str]) -> str:
+    """A remote prompt plus the facts its caller resolved up front, so nothing is left to ask.
+
+    A prompt the turn runs verbatim as a command is left as sent: appended facts
+    would reach the command as extra arguments.
+    """
+    if not facts or is_literal_command(prompt):
+        return prompt
+    lines = "\n".join(f"- {key}: {value}" for key, value in sorted(facts.items()))
+    return f"{prompt}\n\nKnown context:\n{lines}"
+
+
+def invocation_key(
+    tool_name: str, arguments: Mapping[str, Any], *, schema: Mapping[str, Any] | None = None
+) -> str:
+    """Names one tool call: the tool plus a digest of the arguments that change what it does.
+
+    An argument left out, given as ``None`` or given as its schema default is the
+    same call as one that spells the default out, so a grant survives the model
+    restating the call in either form.
+    """
+    effective = _effective_arguments(arguments, schema)
+    canonical = json.dumps(effective, sort_keys=True, default=str, ensure_ascii=False)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"{tool_name}:{digest}"
 
 
+def _effective_arguments(
+    arguments: Mapping[str, Any], schema: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    properties = schema.get("properties") if isinstance(schema, Mapping) else None
+    defaults: dict[str, Any] = {}
+    if isinstance(properties, Mapping):
+        for name, spec in properties.items():
+            if isinstance(spec, Mapping) and "default" in spec:
+                defaults[name] = spec["default"]
+    effective: dict[str, Any] = {}
+    for name, value in arguments.items():
+        if value is None:
+            continue
+        if name in defaults and value == defaults[name]:
+            continue
+        effective[name] = value
+    return effective
+
+
 def approval_question(
-    tool_name: str, arguments: Mapping[str, Any], reason: str, arguments_preview: str
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    reason: str,
+    arguments_preview: str,
+    *,
+    schema: Mapping[str, Any] | None = None,
 ) -> PendingUserChoice:
     """The Approve/Deny choice that stands in for a chat approval button, for one call."""
     details = [part for part in (reason.strip(), arguments_preview.strip()) if part]
-    key = invocation_key(tool_name, arguments)
+    key = invocation_key(tool_name, arguments, schema=schema)
     return PendingUserChoice(
         title=f"Approve {tool_name}?",
         options=(APPROVE_OPTION, DENY_OPTION),
@@ -189,13 +276,14 @@ def _match_option(question: AskUserQuestion, pick: str) -> str | None:
 __all__ = [
     "APPROVE_OPTION",
     "DENY_OPTION",
-    "UNATTENDED_DISABLED_CAPABILITIES",
     "AnswerRejected",
     "UnattendedSessions",
+    "hosted_conversation_id",
     "answer_pending_choice",
     "approval_grant",
     "approval_question",
     "choice_view",
     "invocation_key",
-    "restrict_to_unattended",
+    "prepare_unattended_session",
+    "prompt_with_facts",
 ]

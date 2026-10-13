@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from http import HTTPStatus
 from typing import Any
 from unittest.mock import patch
 
@@ -62,10 +63,15 @@ class TestExecuteGitHubIssueMutationContract(BaseToolContract):
 
 def test_pr_discovery_accepts_explicit_repo_without_configured_default() -> None:
     tool: RegisteredTool = _registered_tool(summarize_github_pr_status)
-    sources = {"github": {"connection_verified": True, "github_token": "tok"}}
+    sources = {
+        "github": {
+            "connection_origin": "webapp",
+            "connection_verified": True,
+            "github_token": "tok",
+        }
+    }
 
     with (
-        patch("integrations.github.tools.work_status.resolve_github_token", return_value=""),
         patch.object(GitHubRestClient, "paginate", return_value=[]) as paginate,
     ):
         assert tool.is_available(sources)
@@ -85,6 +91,50 @@ def test_pr_discovery_accepts_explicit_repo_without_configured_default() -> None
     assert result.is_error is False
     assert result.details["available"] is True
     assert paginate.call_args.args[0] == "/repos/o/r/pulls"
+
+
+@pytest.mark.parametrize(
+    ("owner", "repo"),
+    [
+        ("Tracer-Cloud", "Tracer-Cloud/opensre"),
+        ("", "https://github.com/Tracer-Cloud/opensre"),
+        ("Tracer-Cloud", "opensre"),
+    ],
+)
+def test_pr_status_reads_one_repository_however_the_model_names_it(owner: str, repo: str) -> None:
+    """A full name in ``repo`` was appended to ``owner``, and GitHub answered 404."""
+    with patch.object(GitHubRestClient, "paginate", return_value=[]) as paginate:
+        result = summarize_github_pr_status(
+            github_connection_origin="webapp", owner=owner, repo=repo, github_token="tok"
+        )
+
+    assert result["available"] is True
+    assert paginate.call_args.args[0] == "/repos/Tracer-Cloud/opensre/pulls"
+
+
+def test_pr_status_refuses_a_missing_owner_without_calling_github() -> None:
+    with patch.object(GitHubRestClient, "paginate") as paginate:
+        result = summarize_github_pr_status(
+            github_connection_origin="webapp", owner=None, repo="opensre", github_token="tok"
+        )  # type: ignore[arg-type]
+
+    assert result["available"] is False and "owner" in result["error"]
+    paginate.assert_not_called()
+
+
+def test_pr_status_404_says_the_repository_is_missing_or_not_visible_to_the_token() -> None:
+    not_found = GitHubApiError(
+        "Not Found (https://docs.github.com/rest/pulls/pulls#list-pull-requests)",
+        status_code=HTTPStatus.NOT_FOUND,
+        path="/repos/acme/private/pulls",
+    )
+    with patch.object(GitHubRestClient, "paginate", side_effect=not_found):
+        result = summarize_github_pr_status(
+            github_connection_origin="webapp", owner="acme", repo="private", github_token="tok"
+        )
+
+    assert result["available"] is False
+    assert "acme/private does not exist or the GitHub token cannot see it" in result["error"]
 
 
 def test_list_github_work_items_classifies_taken_and_up_for_grabs() -> None:
@@ -112,7 +162,9 @@ def test_list_github_work_items_classifies_taken_and_up_for_grabs() -> None:
         {"number": 3, "pull_request": {}, "title": "PR returned from issues endpoint"},
     ]
     with patch.object(GitHubRestClient, "paginate", return_value=issues):
-        result = list_github_work_items(owner="o", repo="r", github_token="tok")
+        result = list_github_work_items(
+            github_connection_origin="webapp", owner="o", repo="r", github_token="tok"
+        )
 
     assert result["available"] is True
     assert result["counts"] == {"total": 2, "taken": 1, "up_for_grabs": 1, "unassigned": 0}
@@ -126,10 +178,12 @@ def test_summarize_github_pr_status_uses_detail_mergeability_not_list_nulls(
     list_pr = {
         "number": 10,
         "title": "Ready PR",
+        "state": "open",
         "draft": False,
         "html_url": "https://github.com/o/r/pull/10",
         "user": {"login": "alice"},
-        "head": {"sha": "abc", "ref": "feature"},
+        "head": {"sha": "abc", "ref": "feature", "repo": {"full_name": "o/r"}},
+        "base": {"repo": {"full_name": "o/r"}},
         "mergeable": None,
         "mergeable_state": "unknown",
         "updated_at": "2026-06-28T10:00:00Z",
@@ -150,12 +204,139 @@ def test_summarize_github_pr_status_uses_detail_mergeability_not_list_nulls(
         patch.object(GitHubRestClient, "paginate", return_value=[list_pr]),
         patch.object(GitHubRestClient, "request", fake_request),
     ):
-        result = summarize_github_pr_status(owner="o", repo="r", github_token="tok")
+        result = summarize_github_pr_status(
+            github_connection_origin="webapp", owner="o", repo="r", github_token="tok"
+        )
 
     assert result["counts"]["mergeable"] == 1
     assert result["pull_requests"][0]["mergeability"] == "mergeable"
+    assert result["pull_requests"][0]["repairable"] is True
     if total_checks == 1:
         assert result["work_outcome"]["status"] == "noop"
+    else:
+        assert "work_outcome" not in result
+
+
+_SAME_REPO = {"full_name": "o/r"}
+
+
+@pytest.mark.parametrize(
+    "head_repo, draft, mergeable, mergeable_state, conclusion, noop",
+    [
+        # OpenSRE can never push to these, so they must not hold the scan open.
+        ({"full_name": "fork/r"}, False, False, "dirty", "success", True),
+        (None, False, True, "unstable", "failure", True),
+        (_SAME_REPO, True, True, "unstable", "failure", True),
+        # A repairable PR with failing checks or a conflict still needs the repair.
+        (_SAME_REPO, False, True, "unstable", "failure", False),
+        (_SAME_REPO, False, False, "dirty", "success", False),
+        # Waiting on review or on running checks is not a repair the sweep can make.
+        (_SAME_REPO, False, True, "blocked", "success", True),
+        (_SAME_REPO, False, True, "clean", None, True),
+    ],
+)
+def test_pr_scan_noop_ignores_prs_opensre_cannot_repair(
+    head_repo: dict[str, str] | None,
+    draft: bool,
+    mergeable: bool,
+    mergeable_state: str,
+    conclusion: str | None,
+    noop: bool,
+) -> None:
+    pr = {
+        "number": 12,
+        "title": "Some PR",
+        "state": "open",
+        "draft": draft,
+        "html_url": "https://github.com/o/r/pull/12",
+        "user": {"login": "carol"},
+        "head": {"sha": "fed", "ref": "topic", "repo": head_repo},
+        "base": {"repo": _SAME_REPO},
+        "mergeable": mergeable,
+        "mergeable_state": mergeable_state,
+        "updated_at": "2026-10-04T01:00:00Z",
+    }
+    check = {"name": "test", "conclusion": conclusion, "status": "completed"}
+    if conclusion is None:
+        check["status"] = "in_progress"
+
+    def fake_request(self: GitHubRestClient, method: str, path: str, **_kwargs: Any) -> Any:
+        if path == "/repos/o/r/pulls/12":
+            return pr
+        if path == "/repos/o/r/commits/fed/check-runs":
+            return {"total_count": 1, "check_runs": [check]}
+        raise AssertionError((method, path))
+
+    with (
+        patch.object(GitHubRestClient, "paginate", return_value=[pr]),
+        patch.object(GitHubRestClient, "request", fake_request),
+    ):
+        result = summarize_github_pr_status(
+            github_connection_origin="webapp", owner="o", repo="r", github_token="tok"
+        )
+
+    if noop:
+        assert result["work_outcome"]["status"] == "noop"
+        repairable = result["pull_requests"][0]["repairable"]
+        assert result["work_outcome"]["evidence"]["skipped_prs"] == ([] if repairable else [12])
+    else:
+        assert "work_outcome" not in result
+
+
+@pytest.mark.parametrize(
+    "reads, noop",
+    [
+        # Red checks are another loop's repair; a conflict scan is done with them.
+        ([(True, "unstable")], True),
+        ([(False, "dirty")], False),
+        # GitHub computes mergeability lazily: a re-read that settles counts.
+        ([(None, "unknown"), (True, "clean")], True),
+        # Still unknown after the re-reads: the scan cannot claim nothing conflicts.
+        ([(None, "unknown")] * 3, False),
+    ],
+)
+def test_conflict_scan_judges_conflicts_alone_and_reads_no_checks(
+    reads: list[tuple[bool | None, str]], noop: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("integrations.github.tools.work_status._MERGEABILITY_WAIT_SECONDS", 0)
+    replies = iter(reads)
+
+    def pull_request() -> dict[str, Any]:
+        mergeable, mergeable_state = next(replies)
+        return {
+            "number": 12,
+            "title": "Some PR",
+            "state": "open",
+            "draft": False,
+            "html_url": "https://github.com/o/r/pull/12",
+            "user": {"login": "carol"},
+            "head": {"sha": "fed", "ref": "topic", "repo": _SAME_REPO},
+            "base": {"repo": _SAME_REPO},
+            "mergeable": mergeable,
+            "mergeable_state": mergeable_state,
+            "updated_at": "2026-10-04T01:00:00Z",
+        }
+
+    def fake_request(self: GitHubRestClient, method: str, path: str, **_kwargs: Any) -> Any:
+        if path == "/repos/o/r/pulls/12":
+            return pull_request()
+        raise AssertionError((method, path))
+
+    with (
+        patch.object(GitHubRestClient, "paginate", return_value=[{"number": 12}]),
+        patch.object(GitHubRestClient, "request", fake_request),
+    ):
+        result = summarize_github_pr_status(
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            conflicts_only=True,
+            github_token="tok",
+        )
+
+    if noop:
+        assert result["work_outcome"]["status"] == "noop"
+        assert result["work_outcome"]["operation"] == "conflict-scan:o/r"
     else:
         assert "work_outcome" not in result
 
@@ -184,11 +365,35 @@ def test_summarize_github_pr_status_reports_unknown_mergeability() -> None:
         patch.object(GitHubRestClient, "paginate", return_value=[pr]),
         patch.object(GitHubRestClient, "request", fake_request),
     ):
-        result = summarize_github_pr_status(owner="o", repo="r", github_token="tok")
+        result = summarize_github_pr_status(
+            github_connection_origin="webapp", owner="o", repo="r", github_token="tok"
+        )
 
     assert result["counts"]["unknown"] == 1
     assert result["pull_requests"][0]["status"] == "unknown"
     assert "mergeability unknown" in result["pull_requests"][0]["blocking_reasons"]
+
+
+def test_status_report_preserves_app_authority_through_inner_tools() -> None:
+    def paginate(client: GitHubRestClient, path: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        assert client._token == "selected-token"
+        if path.endswith("/issues"):
+            return [{"number": 1, "title": "Fix CI", "state": "open"}]
+        assert path.endswith("/pulls")
+        return []
+
+    with patch.object(GitHubRestClient, "paginate", paginate):
+        result = generate_work_status_report(
+            owner="o",
+            repo="r",
+            github_token="selected-token",
+            github_connection_origin="webapp",
+            github_connection_id="selected-app",
+        )
+
+    assert result["available"] is True
+    assert result["incomplete"] is False
+    assert "Fix CI" in result["slack_markdown"]
 
 
 def test_generate_work_status_report_surfaces_fetch_errors() -> None:
@@ -202,7 +407,9 @@ def test_generate_work_status_report_surfaces_fetch_errors() -> None:
             return_value={"available": True, "pull_requests": []},
         ),
     ):
-        result = generate_work_status_report(owner="o", repo="r", github_token="tok")
+        result = generate_work_status_report(
+            github_connection_origin="webapp", owner="o", repo="r", github_token="tok"
+        )
 
     assert result["available"] is False
     assert result["incomplete"] is True
@@ -239,7 +446,9 @@ def test_summarize_community_followups_uses_repository_comments_endpoint() -> No
         result = __import__(
             "integrations.github.tools.community_followup_tool",
             fromlist=["summarize_community_followups"],
-        ).summarize_community_followups(owner="o", repo="r", github_token="tok")
+        ).summarize_community_followups(
+            github_connection_origin="webapp", owner="o", repo="r", github_token="tok"
+        )
 
     paginate.assert_called_once()
     assert paginate.call_args.args[0] == "/repos/o/r/issues/comments"
@@ -248,6 +457,8 @@ def test_summarize_community_followups_uses_repository_comments_endpoint() -> No
 
 def test_proposal_id_is_stable_and_payload_has_idempotency_marker() -> None:
     first = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="create",
@@ -256,6 +467,8 @@ def test_proposal_id_is_stable_and_payload_has_idempotency_marker() -> None:
         labels=["hackathon"],
     )
     second = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="create",
@@ -278,6 +491,8 @@ def test_execute_tool_schema_has_no_confirm_parameter() -> None:
 
 def test_execute_create_lists_recent_issues_for_idempotency_marker_before_create() -> None:
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="create",
@@ -296,7 +511,11 @@ def test_execute_create_lists_recent_issues_for_idempotency_marker_before_create
 
     with patch.object(GitHubRestClient, "request", fake_request):
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     assert result["executed"] is True
@@ -310,6 +529,8 @@ def test_execute_create_lists_recent_issues_for_idempotency_marker_before_create
 
 def test_execute_create_returns_existing_issue_for_idempotency_marker() -> None:
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="create",
@@ -325,7 +546,11 @@ def test_execute_create_returns_existing_issue_for_idempotency_marker() -> None:
 
     with patch.object(GitHubRestClient, "request", fake_request):
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     assert result["executed"] is False
@@ -334,6 +559,8 @@ def test_execute_create_returns_existing_issue_for_idempotency_marker() -> None:
 
 def test_execute_create_ignores_pull_request_with_idempotency_marker() -> None:
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="create",
@@ -357,7 +584,11 @@ def test_execute_create_ignores_pull_request_with_idempotency_marker() -> None:
 
     with patch.object(GitHubRestClient, "request", fake_request):
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     assert result["executed"] is True
@@ -366,6 +597,8 @@ def test_execute_create_ignores_pull_request_with_idempotency_marker() -> None:
 
 def test_execute_update_adds_comment_and_preserves_body() -> None:
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="update",
@@ -393,7 +626,11 @@ def test_execute_update_adds_comment_and_preserves_body() -> None:
 
     with patch.object(GitHubRestClient, "request", fake_request):
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     assert result["executed"] is True
@@ -407,6 +644,8 @@ def test_execute_update_adds_comment_and_preserves_body() -> None:
 
 def test_execute_close_comments_before_closing_and_preserves_body() -> None:
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="close",
@@ -431,7 +670,11 @@ def test_execute_close_comments_before_closing_and_preserves_body() -> None:
 
     with patch.object(GitHubRestClient, "request", fake_request):
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     assert result["executed"] is True
@@ -445,6 +688,8 @@ def test_execute_close_comments_before_closing_and_preserves_body() -> None:
 
 def test_execute_update_skips_duplicate_comment_for_seen_marker() -> None:
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="update",
@@ -470,7 +715,11 @@ def test_execute_update_skips_duplicate_comment_for_seen_marker() -> None:
 
     with patch.object(GitHubRestClient, "request", fake_request):
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     assert result["executed"] is True
@@ -490,6 +739,8 @@ def test_execute_update_finds_marker_beyond_the_first_comment_page() -> None:
     recently -- exactly the case an idempotency check has to catch -- and
     the tool would post a duplicate follow-up comment."""
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="update",
@@ -518,7 +769,11 @@ def test_execute_update_finds_marker_beyond_the_first_comment_page() -> None:
 
     with patch.object(GitHubRestClient, "request", fake_request):
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     assert result["executed"] is True
@@ -528,7 +783,11 @@ def test_execute_update_finds_marker_beyond_the_first_comment_page() -> None:
 def test_execute_mutation_rejects_malformed_proposal_without_api_call() -> None:
     with patch.object(GitHubRestClient, "request") as request:
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal={"operation": "create"}, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal={"operation": "create"},
+            github_token="tok",
         )
 
     request.assert_not_called()
@@ -539,6 +798,8 @@ def test_execute_mutation_rejects_malformed_proposal_without_api_call() -> None:
 
 def test_execute_mutation_rejects_payload_without_marker() -> None:
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="create",
@@ -549,7 +810,11 @@ def test_execute_mutation_rejects_payload_without_marker() -> None:
 
     with patch.object(GitHubRestClient, "request") as request:
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     request.assert_not_called()
@@ -566,6 +831,8 @@ def test_execute_create_does_not_rely_on_search_issues_endpoint() -> None:
     check must use the immediately-consistent issues list endpoint instead,
     never /search/issues."""
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="create",
@@ -584,7 +851,11 @@ def test_execute_create_does_not_rely_on_search_issues_endpoint() -> None:
 
     with patch.object(GitHubRestClient, "request", fake_request):
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     assert result["executed"] is True
@@ -592,6 +863,8 @@ def test_execute_create_does_not_rely_on_search_issues_endpoint() -> None:
 
 def test_execute_mutation_returns_api_errors() -> None:
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="close",
@@ -603,7 +876,11 @@ def test_execute_mutation_returns_api_errors() -> None:
         GitHubRestClient, "request", side_effect=GitHubApiError("nope", status_code=403)
     ):
         result = execute_github_issue_mutation(
-            owner="o", repo="r", proposal=proposal, github_token="tok"
+            github_connection_origin="webapp",
+            owner="o",
+            repo="r",
+            proposal=proposal,
+            github_token="tok",
         )
 
     assert result["available"] is False
@@ -614,6 +891,8 @@ def test_execute_mutation_returns_api_errors() -> None:
 def test_requires_approval_runs_without_hook() -> None:
     tool: RegisteredTool = _registered_tool(execute_github_issue_mutation)
     proposal = propose_github_issue_mutation_from_slack(
+        github_connection_origin="webapp",
+        github_token="app-token",
         owner="o",
         repo="r",
         operation="close",
@@ -631,7 +910,7 @@ def test_requires_approval_runs_without_hook() -> None:
                 )
             ],
             [tool],
-            {},
+            {"github": {"connection_origin": "webapp", "auth_token": "app-token"}},
         )[0]
 
     assert result.is_error is False

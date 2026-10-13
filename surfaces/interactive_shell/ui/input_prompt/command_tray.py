@@ -13,6 +13,22 @@ _MAX_VISIBLE_ITEMS = 6
 _INLINE_DESCRIPTION_MIN_WIDTH = 60
 
 
+def _tray_title(buffer: Buffer) -> str:
+    state = buffer.complete_state
+    if state is None:
+        return "Completions"
+    before_cursor = state.original_document.text_before_cursor
+    parts = before_cursor.split()
+    parent = " ".join(parts if before_cursor.endswith(" ") else parts[:-1])
+    if (
+        parent.startswith("/")
+        and state.completions
+        and all(not completion.text.startswith("/") for completion in state.completions)
+    ):
+        return f"Subcommands · {parent}"
+    return "Commands" if state.original_document.text == "/" else "Completions"
+
+
 class CommandTrayControl(UIControl):
     """Render the current completion window without covering live status or input."""
 
@@ -33,11 +49,11 @@ class CommandTrayControl(UIControl):
         state = self.buffer.complete_state
         if state is None or not state.completions:
             return 0
-        # Header, a separated navigation hint, and (on narrow terminals) detail.
+        # Header/list separation, separated navigation, and narrow detail.
         return min(
             max_available_height,
             min(_MAX_VISIBLE_ITEMS, len(state.completions))
-            + 3
+            + 4
             + (width < _INLINE_DESCRIPTION_MIN_WIDTH),
         )
 
@@ -50,11 +66,11 @@ class CommandTrayControl(UIControl):
         show_chrome = height >= 3
         show_detail = width < _INLINE_DESCRIPTION_MIN_WIDTH and height >= 4
         desired_rows = min(_MAX_VISIBLE_ITEMS, len(state.completions))
-        show_hint_spacer = height >= desired_rows + 3 + show_detail
+        show_spacers = height >= desired_rows + 4 + show_detail
         rows = min(
             _MAX_VISIBLE_ITEMS,
             len(state.completions),
-            height - 2 * show_chrome - show_detail - show_hint_spacer,
+            height - 2 * show_chrome - show_detail - 2 * show_spacers,
         )
         self._start = max(0, min(self._start, selected, len(state.completions) - rows))
         if selected >= self._start + rows:
@@ -63,9 +79,11 @@ class CommandTrayControl(UIControl):
         lines: list[StyleAndTextTuples] = []
         if show_chrome:
             counter = f"{selected + 1} / {len(state.completions)}"
-            title = "Commands" if state.original_document.text == "/" else "Completions"
+            title = _tray_title(self.buffer)
             header = title + " " * max(1, width - len(title) - len(counter) - 2) + counter
             lines.append(self._line(header, width, "class:command-tray.hint"))
+            if show_spacers:
+                lines.append(self._line("", width, "class:command-tray.hint"))
 
         name_width = min(24, max(prompt_text_width(c.display_text) for c in visible))
         for offset, completion in enumerate(visible):
@@ -90,7 +108,7 @@ class CommandTrayControl(UIControl):
                     completion_preview_text(include_label=False), width, "class:command-tray.hint"
                 )
             )
-        if show_hint_spacer:
+        if show_spacers:
             lines.append(self._line("", width, "class:command-tray.hint"))
         if show_chrome:
             navigation = "↑↓ navigate   Tab complete   Esc close"

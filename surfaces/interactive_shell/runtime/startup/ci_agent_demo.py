@@ -17,6 +17,7 @@ from core.agent_harness.spi.grounding import (
     GETTING_STARTED_CUSTOM,
     getting_started_skills,
 )
+from core.agent_harness.spi.integrations import resolve_and_cache_integrations
 from infrastructure.scheduling.scheduler.background_service import (
     background_service_state,
     install_background_service,
@@ -27,10 +28,11 @@ from infrastructure.terminal.markdown import ReplyMarkdown
 from infrastructure.terminal.theme import WARNING
 from integrations.github import (
     DEFAULT_LOOP_TIME,
+    github_rest_token,
+    github_setup_url,
     local_timezone,
     loop_card,
     report_looks_complete,
-    resolve_github_token,
     schedule_ci_reliability_loop,
 )
 from surfaces.interactive_shell.runtime.loop_scheduler import reload_loop_scheduler, run_loop_now
@@ -65,10 +67,7 @@ _LOOP_TIME_TITLE = "When should it run?"
 _LOOP_TIME_CUSTOM_LABEL = "Or type a time like 07:30..."
 _LOOP_WEEKDAYS = "weekdays"
 _LOOP_DAILY = "daily"
-_LOOP_TOKEN_MISSING = (
-    "The agent reads GitHub Actions history on every run, which needs a GitHub token. "
-    "Run `opensre integrations setup github`, then `/demo` to continue."
-)
+
 _LOOP_FIRST_PASS_FAILED = (
     "The first pass did not produce the report; the schedule stays in place. "
     "Retry with `/loops run {task_id}` or check `/cron logs {task_id}`."
@@ -123,11 +122,16 @@ def start_ci_agent_demo(
     repository: str | None = None,
 ) -> bool:
     """Scan, choose a repository and time, then schedule and run the reliability loop."""
+    resolved = resolve_and_cache_integrations(session)
+    if not github_rest_token(resolved):
+        _warn(
+            console,
+            f"Connect GitHub in the OpenSRE app, then refresh your connection: {github_setup_url()}",
+        )
+        return False
+    connection_id = str(resolved.get("github", {}).get("connection_id") or "")
     if repository is None:
         snapshot = scan_and_show(console)
-        if not resolve_github_token(None):
-            _warn(console, _LOOP_TOKEN_MISSING)
-            return False
         repository = choose_repository(snapshot, title=_LOOP_REPOSITORY_TITLE)
     if repository is None:
         return False
@@ -141,7 +145,12 @@ def start_ci_agent_demo(
             return False
         time_text, weekdays = schedule
         scheduled = schedule_ci_reliability_loop(
-            owner, repo, time_text=time_text, weekdays=weekdays, timezone=local_timezone()
+            owner,
+            repo,
+            time_text=time_text,
+            weekdays=weekdays,
+            timezone=local_timezone(),
+            github_connection_id=connection_id,
         )
     except ValueError as exc:
         _warn(console, f"Could not schedule the check: {exc}")
@@ -204,9 +213,12 @@ def _run_first_pass(console: Console | None, task_id: str, *, owner: str, repo: 
 def _offer_after_loop(session: Session, console: Console | None) -> bool:
     """Offer the background service and the Slack demo; ``True`` when a prompt was queued."""
     slack = next(
-        skill for skill in getting_started_skills() if skill.name == CONNECTING_SLACK_SKILL_NAME
+        (skill for skill in getting_started_skills() if skill.name == CONNECTING_SLACK_SKILL_NAME),
+        None,
     )
-    choices = [(_NEXT_SLACK, slack.getting_started or slack.name), (_NEXT_EXIT, _NEXT_EXIT_LABEL)]
+    choices = [(_NEXT_EXIT, _NEXT_EXIT_LABEL)]
+    if slack is not None:
+        choices.insert(0, (_NEXT_SLACK, slack.getting_started or slack.name))
     service = background_service_state()
     if service.supported and not service.installed:
         choices.insert(0, (_NEXT_SERVICE, _NEXT_SERVICE_LABEL))
@@ -216,7 +228,7 @@ def _offer_after_loop(session: Session, console: Console | None) -> bool:
     if selected == _NEXT_SERVICE:
         _install_service(console)
         return _offer_after_loop(session, console)
-    if selected == _NEXT_SLACK:
+    if selected == _NEXT_SLACK and slack is not None:
         session.terminal.set_auto_command(slack.getting_started or slack.name)
         return True
     if console is not None:

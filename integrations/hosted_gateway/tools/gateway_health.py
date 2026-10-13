@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from config.constants.hosted_gateway import HOSTED_GATEWAY_SETTINGS_PATH
 from core.domain.types.tools import ToolSurface
 from core.tool import SideEffectLevel
 from core.tool_framework import tool
+from infrastructure.analytics.capture import capture_hosted_gateway_healthy
 from integrations.hosted_gateway.client import (
     GatewayHealth,
     HostedGatewayClient,
@@ -18,7 +18,9 @@ from integrations.hosted_gateway.tools.results import (
     STATE_OUTPUTS,
     failure_output,
     gateway_name,
+    gateway_settings_url,
     hosted_gateway_available,
+    not_provisioned_text,
     state_output,
 )
 
@@ -30,6 +32,7 @@ _COMPONENT = "integrations.hosted_gateway.tools.gateway_health.check_hosted_gate
     name=TOOL_NAME,
     source=SOURCE,
     display_name="Check hosted gateway",
+    compact_description="Check whether the signed-in organization's hosted gateway is running.",
     description=(
         "Check whether the signed-in user's organization has an OpenSRE hosted gateway "
         "(the managed Fargate container that runs CI/CD repair loops remotely) and "
@@ -55,18 +58,17 @@ def check_hosted_gateway() -> dict[str, Any]:
     try:
         with HostedGatewayClient.from_account() as client:
             health = client.health()
-            settings_url = f"{client.app_url}{HOSTED_GATEWAY_SETTINGS_PATH}"
+            settings_url = gateway_settings_url(client.app_url)
     except HostedGatewayError as exc:
         return failure_output(exc, tool_name=TOOL_NAME, component=_COMPONENT)
+    if health.healthy:
+        capture_hosted_gateway_healthy(gateway_id=health.gateway_id, tool_name=TOOL_NAME)
     return state_output(health, _describe(health, settings_url))
 
 
 def _describe(health: GatewayHealth, settings_url: str) -> str:
     if not health.provisioned:
-        return (
-            "Your organization has no hosted gateway yet. An organization admin can set "
-            f"it up at {settings_url}."
-        )
+        return not_provisioned_text(settings_url)
     name = gateway_name(health)
     if health.healthy:
         return f"Your organization's hosted gateway{name} is running."

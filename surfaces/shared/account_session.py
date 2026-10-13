@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -21,6 +22,19 @@ from config.account_credits import AccountCredits, parse_credit_balance_payload
 from config.constants.account import (
     OPENSRE_ACCOUNT_HTTP_TIMEOUT_SECONDS,
     OPENSRE_ACCOUNT_SESSION_PATH,
+    OPENSRE_ACCOUNT_SESSION_RETRY_BUDGET_SECONDS,
+    OPENSRE_ACCOUNT_SESSION_RETRY_DELAYS_SECONDS,
+)
+
+#: Answers that say the app is briefly unable to answer, not that the login is bad.
+_TRANSIENT_STATUSES = frozenset(
+    {
+        HTTPStatus.TOO_MANY_REQUESTS,
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        HTTPStatus.BAD_GATEWAY,
+        HTTPStatus.SERVICE_UNAVAILABLE,
+        HTTPStatus.GATEWAY_TIMEOUT,
+    }
 )
 
 
@@ -57,22 +71,30 @@ def _mapping(value: object, key: str) -> Mapping[str, object] | None:
 
 
 def _refreshed_record(payload: object, record: AccountRecord) -> AccountRecord | None:
-    """Return current server-owned account metadata when the response is usable."""
+    """Return current identity and active workspace when the response is usable."""
+    if not isinstance(payload, Mapping):
+        return None
+    if "organization" not in payload:
+        return None
     user = _mapping(payload, "user")
     organization = _mapping(payload, "organization")
     llm = _mapping(payload, "llm")
-    if user is None or organization is None or llm is None or not isinstance(payload, Mapping):
+    if user is None or llm is None:
+        return None
+    if payload.get("organization") is not None and organization is None:
         return None
     user_id = user.get("id")
-    organization_id = organization.get("id")
+    organization_id = organization.get("id") if organization is not None else None
     provider = llm.get("provider")
     model = llm.get("model")
     expires_at = payload.get("expires_at")
     if (
         not isinstance(user_id, str)
         or not user_id
-        or not isinstance(organization_id, str)
-        or not organization_id
+        or (
+            organization_id is not None
+            and (not isinstance(organization_id, str) or not organization_id.strip())
+        )
         or provider != "openai"
         or not isinstance(model, str)
         or not model.strip()
@@ -80,14 +102,43 @@ def _refreshed_record(payload: object, record: AccountRecord) -> AccountRecord |
         or not expires_at
     ):
         return None
-    if user_id != record.user_id or organization_id != record.organization_id:
+    if user_id != record.user_id:
         return None
     return replace(
         record,
+        organization_id=(organization_id.strip() if isinstance(organization_id, str) else None),
         token_expires_at=expires_at,
         llm_provider=provider,
         llm_model=model.strip(),
     )
+
+
+def _get_session(url: str, token: str) -> httpx.Response:
+    """GET the session, retrying a timeout, a dropped connection or a 429/5xx.
+
+    Every attempt and pause fits in one overall budget, so an app that never
+    answers is reported in that time rather than after every full timeout.
+    Raises the last transport error when no attempt connected.
+    """
+    deadline = time.monotonic() + OPENSRE_ACCOUNT_SESSION_RETRY_BUDGET_SECONDS
+    delays = iter(OPENSRE_ACCOUNT_SESSION_RETRY_DELAYS_SECONDS)
+    while True:
+        remaining = deadline - time.monotonic()
+        try:
+            response = httpx.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=min(OPENSRE_ACCOUNT_HTTP_TIMEOUT_SECONDS, remaining),
+            )
+        except httpx.TransportError:
+            delay = next(delays, None)
+            if delay is None or time.monotonic() + delay >= deadline:
+                raise
+        else:
+            delay = next(delays, None) if response.status_code in _TRANSIENT_STATUSES else None
+            if delay is None or time.monotonic() + delay >= deadline:
+                return response
+        time.sleep(delay)
 
 
 def account_status(*, app_url: str | None = None) -> AccountStatus:
@@ -122,11 +173,7 @@ def account_status(*, app_url: str | None = None) -> AccountStatus:
             "The stored OpenSRE app URL is invalid.",
         )
     try:
-        response = httpx.get(
-            f"{resolved_app_url}{OPENSRE_ACCOUNT_SESSION_PATH}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=OPENSRE_ACCOUNT_HTTP_TIMEOUT_SECONDS,
-        )
+        response = _get_session(f"{resolved_app_url}{OPENSRE_ACCOUNT_SESSION_PATH}", token)
     except httpx.HTTPError:
         return AccountStatus(
             AccountSessionState.UNAVAILABLE,

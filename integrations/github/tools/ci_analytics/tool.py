@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from http import HTTPStatus
 from typing import Any
 
 from rich.markup import escape
@@ -16,18 +16,35 @@ from core.domain.types.tools import ToolSurface
 from core.tool import SideEffectLevel, report_run_error
 from core.tool_framework import tool
 from core.tool_framework.utils import tool_unavailable
-from integrations.github.client import GitHubApiError, resolve_github_token
+from integrations.github.agent_tools import (
+    github_tool_params,
+    require_webapp_github,
+)
+from integrations.github.client import GitHubApiError
+from integrations.github.envelope import missing_token_envelope
 from integrations.github.helpers import (
     GITHUB_INJECTED_PARAMS,
     github_creds,
-    github_source_available,
 )
 from integrations.github.repo_scope import detect_git_remote_repo_scope
+from integrations.github.rest_token import (
+    resolved_github_rest_token,
+)
 from integrations.github.tools.ci_analytics.analysis import analyze_repository
 from integrations.github.tools.ci_analytics.benchmarks import MEASURED_ON
+from integrations.github.tools.ci_analytics.failure import (
+    analysis_failure,
+    is_operational_failure,
+)
 from integrations.github.tools.ci_analytics.loop import LOOP_WINDOW_DAYS
 from integrations.github.tools.ci_analytics.models import CiAnalyticsReport, FailureKind
 from integrations.github.tools.ci_analytics.payload import report_payload
+from integrations.github.tools.ci_analytics.prefetch import (
+    PrefetchedAnalysis,
+    analysis_request,
+    claim_analysis_prefetch,
+    start_analysis_prefetch,
+)
 from integrations.github.tools.ci_analytics.render import (
     comparison_figures,
     comparison_markdown,
@@ -54,13 +71,51 @@ _MIN_WINDOW_DAYS = 1
 _MAX_WINDOW_DAYS = 90
 
 
-def _available(sources: dict[str, dict]) -> bool:
-    gh = sources.get("github", {})
-    return bool(
-        github_source_available(sources)
-        or resolve_github_token(None)
-        or github_creds(gh).get("github_token")
-    )
+def _available(_sources: dict[str, dict]) -> bool:
+    """Keep recovery available; execution enforces the app connection."""
+    return True
+
+
+def _window(days: int | None) -> int:
+    return min(max(int(days or _DEFAULT_WINDOW_DAYS), _MIN_WINDOW_DAYS), _MAX_WINDOW_DAYS)
+
+
+def _repository(owner: str | None, repo: str | None) -> tuple[str, str]:
+    return (owner or "").strip(), (repo or "").strip().removesuffix(".git")
+
+
+def prefetch_ci_analysis(
+    owner: str,
+    repo: str,
+    *,
+    resolved_integrations: Mapping[str, Any],
+    days: int | None = None,
+) -> bool:
+    """Start the live read an ``analyze_github_ci_reliability(owner, repo, days)`` call would make.
+
+    Runs in the background with the token that call would resolve from
+    ``resolved_integrations``; that call, made within a few minutes, takes the
+    result instead of reading GitHub again and still writes the snapshot and
+    builds the result itself. Prints and records nothing. False when nothing
+    was started (no repository, no token, or one already running).
+    """
+    repo_owner, repo_name = _repository(owner, repo)
+    token = resolved_github_rest_token(resolved_integrations)
+    if not repo_owner or not repo_name or not token:
+        return False
+    window = _window(days)
+
+    def work() -> PrefetchedAnalysis:
+        now = datetime.now(UTC)
+        analysis = analyze_repository(repo_owner, repo_name, token=token, days=window, now=now)
+        return PrefetchedAnalysis(analysis=analysis, now=now)
+
+    request = analysis_request(repo_owner, repo_name, days=window, token=token)
+    return start_analysis_prefetch(request, work)
+
+
+def _missing_token_message(repository: str) -> str:
+    return f"Connect or reconnect GitHub in the OpenSRE app before analyzing {repository}. End the turn without retrying."
 
 
 def _extract_params(sources: dict[str, dict]) -> dict[str, Any]:
@@ -89,23 +144,6 @@ def _console(context: Any) -> Any:
     except RuntimeError:
         return None
     return console if getattr(console, "is_terminal", False) else None
-
-
-def _failure_message(exc: Exception, *, repository: str) -> str:
-    """User-facing failure text by status class; exception detail stays in Sentry only."""
-    status = getattr(exc, "status_code", None)
-    if status in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}:
-        return (
-            f"GitHub rejected the token for {repository}; it needs read access to Actions and "
-            "pull requests. Run `opensre integrations setup github` and try again."
-        )
-    if status == HTTPStatus.NOT_FOUND:
-        return f"GitHub repository {repository} was not found or is not accessible with this token."
-    if status == HTTPStatus.TOO_MANY_REQUESTS:
-        return f"GitHub rate limit reached while reading {repository}; try again in a few minutes."
-    if isinstance(exc, ValueError):
-        return f"GitHub returned an unexpected payload for {repository}; the report was not built."
-    return f"Could not read the GitHub Actions history of {repository} ({type(exc).__name__})."
 
 
 def _map_evidence(evidence: dict[str, Any], output: dict[str, Any], _input: dict[str, Any]) -> None:
@@ -197,6 +235,7 @@ def _result(report: CiAnalyticsReport, owner: str, repo: str, window: int) -> di
     name=TOOL_NAME,
     source=_SOURCE,
     display_name="Analyze CI reliability",
+    compact_description="Measure recent GitHub Actions reliability and developer wait time.",
     description=(
         "Read a repository's recent GitHub Actions history and report CI/CD "
         "reliability KPIs: executions, PR failure rate, failures classified as "
@@ -271,10 +310,11 @@ def _result(report: CiAnalyticsReport, owner: str, repo: str, window: int) -> di
         "additionalProperties": False,
     },
     is_available=_available,
-    extract_params=_extract_params,
+    extract_params=github_tool_params(_extract_params),
     injected_params=GITHUB_INJECTED_PARAMS,
     evidence_mapper=_map_evidence,
 )
+@require_webapp_github
 def analyze_github_ci_reliability(
     owner: str | None = None,
     repo: str | None = None,
@@ -293,9 +333,8 @@ def analyze_github_ci_reliability(
     choice to make. Every analysis reads GitHub: a saved snapshot is written
     for the scheduled loop, never used to answer here.
     """
-    window = min(max(int(days or _DEFAULT_WINDOW_DAYS), _MIN_WINDOW_DAYS), _MAX_WINDOW_DAYS)
-    repo_owner = (owner or "").strip()
-    repo_name = (repo or "").strip().removesuffix(".git")
+    window = _window(days)
+    repo_owner, repo_name = _repository(owner, repo)
     if not repo_owner or not repo_name:
         detected = detect_git_remote_repo_scope(workspace)
         if detected is not None:
@@ -308,13 +347,13 @@ def analyze_github_ci_reliability(
         )
     now = datetime.now(UTC)
     console = _console(context)
-    token = resolve_github_token(github_token)
+    token = (github_token or "").strip()
     if not token:
-        message = (
-            f"A GitHub token is required to read the Actions history of {repo_owner}/{repo_name}. "
-            "Run `opensre integrations setup github` and try again."
+        repository = f"{repo_owner}/{repo_name}"
+        return missing_token_envelope(
+            _missing_token_message(repository),
+            blocked=f"the Actions history of {repository} can't be read",
         )
-        return tool_unavailable(_SOURCE, message, response_text=message)
     if console is not None:
         # Two-column lead matches the shell's reply gutter so the tool's lines
         # hang with the agent's notes instead of breaking the transcript edge.
@@ -329,21 +368,33 @@ def analyze_github_ci_reliability(
         def progress(line: str) -> None:
             console.print(f"  [dim]{escape(line)}[/dim]")
 
-    try:
-        analysis = analyze_repository(
-            repo_owner, repo_name, token=token, days=window, now=now, progress=progress
-        )
-    except (GitHubApiError, ValueError) as exc:
-        report_run_error(
-            exc,
-            tool_name=TOOL_NAME,
-            source=_SOURCE,
-            component="integrations.github.tools.ci_analytics.tool",
-            method="collect_runs",
-            extras={"owner": repo_owner, "repo": repo_name},
-        )
-        message = _failure_message(exc, repository=f"{repo_owner}/{repo_name}")
-        return tool_unavailable(_SOURCE, message, response_text=message)
+    # The read started when this repository was picked, when its arguments
+    # match; any failure there leaves this call to read and report on its own.
+    request = analysis_request(repo_owner, repo_name, days=window, token=token)
+    prefetched = claim_analysis_prefetch(request)
+    if prefetched is not None:
+        analysis, now = prefetched.analysis, prefetched.now
+    else:
+        try:
+            analysis = analyze_repository(
+                repo_owner, repo_name, token=token, days=window, now=now, progress=progress
+            )
+        except (GitHubApiError, ValueError) as exc:
+            # A rate limit, a rejected token or an untrusted certificate is a
+            # fact about GitHub or this machine that the result already states;
+            # only an unexpected failure earns a stack in the shell.
+            operational = is_operational_failure(exc)
+            report_run_error(
+                exc,
+                tool_name=TOOL_NAME,
+                source=_SOURCE,
+                component="integrations.github.tools.ci_analytics.tool",
+                method="collect_runs",
+                severity="warning" if operational else "error",
+                extras={"owner": repo_owner, "repo": repo_name},
+                include_traceback=not operational,
+            )
+            return analysis_failure(exc, owner=repo_owner, repo=repo_name, now=datetime.now(UTC))
     report = analysis.report
     try:
         write_snapshot(
@@ -371,4 +422,9 @@ def analyze_github_ci_reliability(
     return _result(report, repo_owner, repo_name, window)
 
 
-__all__ = ["report_text_from_snapshot", "TOOL_NAME", "analyze_github_ci_reliability"]
+__all__ = [
+    "report_text_from_snapshot",
+    "TOOL_NAME",
+    "analyze_github_ci_reliability",
+    "prefetch_ci_analysis",
+]

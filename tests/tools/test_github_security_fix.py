@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import subprocess
 from contextlib import nullcontext
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from core.agent_harness.tools.tool_context import (
     ACTION_TOOL_CONTEXT_RESOURCE_KEY,
@@ -15,7 +18,7 @@ from core.agent_harness.tools.tool_context import (
 )
 from core.tool.contracts import AgentToolContext, RegisteredTool
 from integrations.coding_agent import CodingResult
-from integrations.github.client import GitHubRestClient
+from integrations.github.client import GitHubApiError, GitHubRestClient
 from integrations.github.pull_requests import PullRequest
 from integrations.github.tools.security_fix.context import (
     SecurityAlertContext,
@@ -23,9 +26,10 @@ from integrations.github.tools.security_fix.context import (
     parse_security_alert_url,
 )
 from integrations.github.tools.security_fix.errors import (
-    ERR_ALERT_NOT_FOUND,
     ERR_CONFIRMATION_DENIED,
+    ERR_GITHUB_UNAVAILABLE,
     ERR_NO_AUTOFIXABLE_FINDING,
+    ERR_NO_ELIGIBLE_ALERT,
     ERR_UNSUPPORTED_ALERT_TYPE,
     GitHubSecurityFixError,
 )
@@ -127,7 +131,7 @@ def test_available_when_github_token_present(monkeypatch) -> None:
     assert _github_security_fix_available({}) is False
 
     monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    assert _github_security_fix_available({}) is True
+    assert _github_security_fix_available({}) is False
 
 
 def test_available_with_configured_auth_token(monkeypatch) -> None:
@@ -135,7 +139,12 @@ def test_available_with_configured_auth_token(monkeypatch) -> None:
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_MCP_AUTH_TOKEN", raising=False)
 
-    assert _github_security_fix_available({"github": {"auth_token": "store-token"}}) is True
+    assert (
+        _github_security_fix_available(
+            {"github": {"connection_origin": "webapp", "auth_token": "store-token"}}
+        )
+        is True
+    )
 
 
 def test_ship_gate_uses_injected_token(monkeypatch) -> None:
@@ -247,7 +256,7 @@ def test_gather_code_scanning_page_url_targets_code_scanning_alerts() -> None:
         paths.append(path)
         if path.endswith("/code-scanning/alerts"):
             return [alert]
-        if path.endswith("/code-scanning/alerts/7/instances"):
+        if path.endswith("/code-scanning/alerts/7/instances") or path.endswith("/pulls"):
             return []
         raise AssertionError(f"unexpected path: {path}")
 
@@ -263,6 +272,7 @@ def test_gather_code_scanning_page_url_targets_code_scanning_alerts() -> None:
     assert "gateway/web/webapp.py:20" in ctx.task
     assert paths == [
         "/repos/acme/app/code-scanning/alerts",
+        "/repos/acme/app/pulls",
         "/repos/acme/app/code-scanning/alerts/7/instances",
     ]
 
@@ -371,13 +381,14 @@ def test_gather_auto_no_open_findings_reports_no_pr() -> None:
             github_token="tok",
         )
 
-    assert result["success"] is False
-    assert result["error_kind"] == ERR_ALERT_NOT_FOUND
-    assert result["error"] == (
+    # Nothing open is a verified no-op, so a scheduled sweep records it as done.
+    assert result["success"] is True
+    assert result["error_kind"] == ERR_NO_ELIGIBLE_ALERT
+    assert "error" not in result
+    assert result["response_text"] == (
         "No open Dependabot, code-scanning, or Code Quality findings found in "
         "acme/app; no PR was created."
     )
-    assert result["response_text"] == result["error"]
 
 
 def test_gather_auto_with_only_unsupported_findings_reports_no_autofixable() -> None:
@@ -465,6 +476,156 @@ def test_gather_auto_without_builtin_preference_can_select_unsupported_finding()
 
     assert ctx.alert_type == "code_quality"
     assert ctx.number == 42
+
+
+def _code_scanning_alert(
+    number: int, *, security: str = "", severity: str = "warning", tags: list[str] | None = None
+) -> dict[str, Any]:
+    return {
+        "number": number,
+        "html_url": f"https://github.com/acme/app/security/code-scanning/{number}",
+        "rule": {
+            "id": f"py/rule-{number}",
+            "description": f"Rule {number}",
+            "severity": severity,
+            "security_severity_level": security or None,
+            "tags": tags or ["maintainability"],
+        },
+        "most_recent_instance": {"location": {"path": "app/main.py", "start_line": number}},
+    }
+
+
+def _open_pull(ref: str, repository: str = "acme/app") -> dict[str, Any]:
+    return {"head": {"ref": ref, "repo": {"full_name": repository}}}
+
+
+def test_auto_select_skips_findings_with_an_open_opensre_fix_pr() -> None:
+    pulls = [
+        _open_pull("opensre/github-security-fix-code_scanning-5-abc1234"),
+        # #30's fix must not hide #3, and a fork naming its branch like ours is not our fix.
+        _open_pull("opensre/github-security-fix-code_scanning-30-def5678"),
+        _open_pull("opensre/github-security-fix-code_scanning-3-0a1b2c3", "evil/app"),
+    ]
+
+    def fake_paginate(_self: GitHubRestClient, path: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        if path.endswith("/code-scanning/alerts"):
+            return [
+                _code_scanning_alert(5, security="critical"),
+                _code_scanning_alert(3, security="high"),
+            ]
+        return pulls if path.endswith("/pulls") else []
+
+    with patch.object(GitHubRestClient, "paginate", fake_paginate):
+        ctx = gather_security_alert_context(
+            owner="acme", repo="app", alert_type="code_scanning", github_token="tok"
+        )
+
+    assert ctx.number == 3
+
+
+def test_auto_select_with_every_finding_in_flight_is_a_noop() -> None:
+    def fake_paginate(_self: GitHubRestClient, path: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        if path.endswith("/code-scanning/alerts"):
+            return [_code_scanning_alert(5)]
+        if path.endswith("/pulls"):
+            return [_open_pull("opensre/github-security-fix-code_scanning-5-abc1234")]
+        return []
+
+    with (
+        patch.object(GitHubRestClient, "paginate", fake_paginate),
+        patch(
+            "integrations.github.tools.security_fix.runner.verify_coding_agent",
+            return_value=(True, ""),
+        ),
+    ):
+        result = fix_github_security_alert(
+            github_connection_origin="webapp",
+            owner="acme",
+            repo="app",
+            alert_type="code_scanning",
+            open_pr=True,
+            github_token="tok",
+        )
+
+    assert result["error_kind"] == ERR_NO_ELIGIBLE_ALERT
+    assert result["work_outcome"]["status"] == "noop"
+    assert "error" not in result
+
+
+def test_quality_only_never_selects_a_security_finding() -> None:
+    paths: list[str] = []
+
+    def fake_paginate(_self: GitHubRestClient, path: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        paths.append(path)
+        if path.endswith("/code-scanning/alerts"):
+            return [
+                _code_scanning_alert(8, security="high", severity="error"),
+                _code_scanning_alert(9, severity="error", tags=["security", "correctness"]),
+                _code_scanning_alert(4, severity="note"),
+            ]
+        return []
+
+    with patch.object(GitHubRestClient, "paginate", fake_paginate):
+        ctx = gather_security_alert_context(
+            owner="acme", repo="app", github_token="tok", quality_only=True
+        )
+
+    assert ctx.number == 4
+    assert not any("dependabot" in path for path in paths)
+
+
+def test_quality_only_refuses_an_explicit_security_alert() -> None:
+    def fake_request(_self: GitHubRestClient, _method: str, _path: str, **_kwargs: Any) -> Any:
+        return _code_scanning_alert(8, security="high")
+
+    with (
+        patch.object(GitHubRestClient, "request", fake_request),
+        pytest.raises(GitHubSecurityFixError) as raised,
+    ):
+        gather_security_alert_context(
+            owner="acme",
+            repo="app",
+            alert_type="code_scanning",
+            alert_number=8,
+            github_token="tok",
+            quality_only=True,
+        )
+
+    assert raised.value.kind == ERR_UNSUPPORTED_ALERT_TYPE
+
+
+@pytest.mark.parametrize(
+    "failure, selected",
+    [
+        # A transient failure may hide the top-ranked finding, so nothing is chosen.
+        (GitHubApiError("Server Error", status_code=HTTPStatus.INTERNAL_SERVER_ERROR), None),
+        (GitHubApiError("API rate limit exceeded", status_code=HTTPStatus.FORBIDDEN), None),
+        # A type the repository has not enabled holds nothing to fix.
+        (GitHubApiError("Code Quality is not enabled", status_code=HTTPStatus.NOT_FOUND), 4),
+    ],
+)
+def test_auto_select_stops_when_a_finding_type_cannot_be_read(
+    failure: GitHubApiError, selected: int | None
+) -> None:
+    def fake_paginate(_self: GitHubRestClient, path: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        if path.endswith("/code-quality/findings"):
+            raise failure
+        if path.endswith("/code-scanning/alerts"):
+            return [_code_scanning_alert(4, severity="note")]
+        return []
+
+    with patch.object(GitHubRestClient, "paginate", fake_paginate):
+        if selected is None:
+            with pytest.raises(GitHubSecurityFixError) as raised:
+                gather_security_alert_context(
+                    owner="acme", repo="app", github_token="tok", quality_only=True
+                )
+            assert raised.value.kind == ERR_GITHUB_UNAVAILABLE
+        else:
+            ctx = gather_security_alert_context(
+                owner="acme", repo="app", github_token="tok", quality_only=True
+            )
+            assert ctx.number == selected
 
 
 def test_secret_scanning_alerts_are_refused_without_fetching() -> None:
@@ -830,7 +991,9 @@ def test_tool_passes_repl_confirmation_function() -> None:
         "integrations.github.tools.security_fix.tool.run_security_fix",
         return_value={"success": True},
     ) as runner:
-        result = fix_github_security_alert(context=agent_context)
+        result = fix_github_security_alert(
+            github_connection_origin="webapp", github_token="app-token", context=agent_context
+        )
 
     assert result["success"] is True
     assert result["work_outcome"]["status"] == "succeeded"
@@ -844,7 +1007,7 @@ def test_registry_discovers_security_fix_on_action_surface() -> None:
 
     tool = action["fix_github_security_alert"]
     assert tool.surfaces == ("action",)
-    assert tool.requires_approval is True
+    assert tool.requires_approval is False
     assert tool.side_effect_level == "mutating"
     assert "fix_github_security_alert" not in chat
 

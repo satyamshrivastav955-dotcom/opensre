@@ -54,7 +54,7 @@ def test_turn_interaction_facts_include_hosted_credits(
             "OpenSRE hosted credits.",
         )
 
-    monkeypatch.setattr("core.llm.hosted_credits.account_llm_route", lambda: object())
+    monkeypatch.setattr("core.llm.hosted_credits.account_llm_route", object)
     monkeypatch.setattr("core.llm.hosted_credits.cached_hosted_credits", _hosted_read)
     text = turn_interaction_facts_block(_snapshot(prompt_surface="interactive_shell"))
     assert "OpenSRE hosted credits remaining are 12,500" in text

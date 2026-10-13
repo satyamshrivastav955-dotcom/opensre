@@ -18,8 +18,17 @@ from config.constants.gateway import (
     PROMPT_WORKER_STOP_TIMEOUT_SECONDS,
     WEB_STOP_TIMEOUT_SECONDS,
 )
+from config.constants.organization import organization_id
+from config.constants.paths import ContextRootOwnerMismatchError
 from gateway.core.process.shutdown_budget import ShutdownBudget
-from gateway.core.prompt_intake import PromptQueue, PromptTurnRunner, PromptWorker
+from gateway.core.prompt_intake import (
+    JsonlPromptJobStore,
+    PromptQueue,
+    PromptTurnRunner,
+    PromptWorker,
+    actor_conversation,
+    prompt_jobs_path,
+)
 from gateway.transports.names import TransportName
 from gateway.transports.startup import (
     TransportHandle,
@@ -28,10 +37,13 @@ from gateway.transports.startup import (
 )
 from gateway.web.startup import start_web_server
 from gateway.web.web_server import WebAppServerHandle
+from infrastructure.analytics.provider import analytics_delivery_unavailable
+from infrastructure.turn_host.concurrency import process_turn_gate
 from infrastructure.turn_host.turn_callback import TurnCallback
 
 _WEB_COMPONENT = "web"
 _PROMPT_COMPONENT = "remote prompts"
+_ANALYTICS_COMPONENT = "analytics"
 
 
 @dataclass
@@ -83,6 +95,12 @@ def start_gateway(
     statuses[_WEB_COMPONENT] = web.status
     for name, status in chat.statuses.items():
         statuses[name] = status
+    # A silo whose analytics destination fails closed (for example a webapp URL
+    # without AGENT_USAGE_SECRET) silently drops every product event, so none of
+    # its remote sessions ever reach the dashboard. Local runs keep the anonymous
+    # fallback destination and never trip this.
+    if organization_id() and analytics_delivery_unavailable():
+        statuses[_ANALYTICS_COMPONENT] = "failed"
     return StartedGateway(
         web_server=web.server,
         transports={handle.name: handle for handle in chat.handles},
@@ -92,14 +110,29 @@ def start_gateway(
 
 
 def start_prompt_intake(*, logger: logging.Logger, runner: PromptTurnRunner) -> PromptWorker:
-    """Attach a prompt queue to the web app and start the thread that runs its jobs."""
+    """Attach a prompt queue to the web app and start the threads that run its jobs.
+
+    One thread per process turn slot, so remote prompts can fill every slot; each
+    still takes the shared gate, so chat and scheduled turns compete for the same
+    slots. The queue keeps its records on the deployment's home and takes back the
+    ones the previous task left, so a replaced task still answers parked questions.
+    """
     from gateway.web.webapp import app
 
-    queue = PromptQueue()
+    queue = PromptQueue(store=_prompt_job_store(logger), hosted_conversation=actor_conversation)
     app.state.prompt_queue = queue
-    worker = PromptWorker(queue, runner, logger=logger)
+    worker = PromptWorker(queue, runner, logger=logger, workers=process_turn_gate().limit)
     worker.start()
     return worker
+
+
+def _prompt_job_store(logger: logging.Logger) -> JsonlPromptJobStore | None:
+    """The durable record file, or ``None`` (memory only) when the mount has no owner."""
+    try:
+        return JsonlPromptJobStore(prompt_jobs_path())
+    except ContextRootOwnerMismatchError:
+        logger.error("remote prompts are kept in memory only: the context root has no owner")
+        return None
 
 
 __all__ = [

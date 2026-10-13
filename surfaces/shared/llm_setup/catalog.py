@@ -148,6 +148,9 @@ class ProviderOption:
 # Source: https://docs.anthropic.com/en/docs/about-claude/models/overview
 ANTHROPIC_MODELS = (
     ModelOption(value=ANTHROPIC_REASONING_MODEL, label="Claude Opus 4.7"),
+    ModelOption(value="claude-sonnet-5-5", label="Claude Sonnet 5.5"),
+    ModelOption(value="claude-opus-5-5", label="Claude Opus 5.5"),
+    ModelOption(value="claude-fable-5-1", label="Claude Fable 5.1"),
     ModelOption(value="claude-fable-5", label="Claude Fable 5 — most capable"),
     ModelOption(value="claude-sonnet-4-6", label="Claude Sonnet 4.6"),
     ModelOption(value="claude-haiku-4-5", label="Claude Haiku 4.5"),
@@ -158,7 +161,8 @@ ANTHROPIC_MODELS = (
 # provider uses Chat Completions, while Codex models require a different API path.
 OPENAI_MODELS = (
     ModelOption(value=OPENAI_REASONING_MODEL, label="GPT-5.4 mini"),
-    ModelOption(value="gpt-5.6-sol", label="GPT-5.6 Sol — flagship"),
+    ModelOption(value="gpt-6.1-sol", label="GPT-6.1 Sol — flagship"),
+    ModelOption(value="gpt-5.6-sol", label="GPT-5.6 Sol"),
     ModelOption(value="gpt-5.6-terra", label="GPT-5.6 Terra — balanced"),
     ModelOption(value="gpt-5.6-luna", label="GPT-5.6 Luna — cost-efficient"),
     ModelOption(value="gpt-5.5", label="GPT-5.5"),
@@ -169,6 +173,7 @@ OPENAI_MODELS = (
 # Source: https://openrouter.ai/api/v1/models
 OPENROUTER_MODELS = (
     ModelOption(value=OPENROUTER_REASONING_MODEL, label="OpenRouter Auto (smart routing)"),
+    ModelOption(value="openai/gpt-6.1-sol", label="GPT-6.1 Sol (via OpenRouter)"),
     ModelOption(value="openai/gpt-5.6-sol", label="GPT-5.6 Sol (via OpenRouter)"),
     ModelOption(value="openai/gpt-5.6-terra", label="GPT-5.6 Terra (via OpenRouter)"),
     ModelOption(value="openai/gpt-5.6-luna", label="GPT-5.6 Luna (via OpenRouter)"),
@@ -335,6 +340,9 @@ CLAUDE_CODE_MODELS = (
         value="",
         label="CLI default (no --model; use Claude Code configured model)",
     ),
+    ModelOption(value="claude-sonnet-5-5", label="Claude Sonnet 5.5 — balanced"),
+    ModelOption(value="claude-opus-5-5", label="Claude Opus 5.5"),
+    ModelOption(value="claude-fable-5-1", label="Claude Fable 5.1"),
     ModelOption(value="claude-fable-5", label="Claude Fable 5 — most capable"),
     ModelOption(value="claude-opus-4-7", label="Claude Opus 4.7"),
     ModelOption(value="claude-sonnet-4-6", label="Claude Sonnet 4.6 — balanced"),
@@ -348,7 +356,8 @@ CODEX_MODELS = (
         value="",
         label="CLI default (no -m; use Codex configured model)",
     ),
-    ModelOption(value="gpt-5.6-sol", label="gpt-5.6-sol — newest frontier coding"),
+    ModelOption(value="gpt-6.1-sol", label="gpt-6.1-sol — newest frontier coding"),
+    ModelOption(value="gpt-5.6-sol", label="gpt-5.6-sol — frontier coding"),
     ModelOption(value="gpt-5.6-terra", label="gpt-5.6-terra — balanced"),
     ModelOption(value="gpt-5.6-luna", label="gpt-5.6-luna — fast, cost-efficient"),
     ModelOption(value="gpt-5.5", label="gpt-5.5 — frontier coding"),

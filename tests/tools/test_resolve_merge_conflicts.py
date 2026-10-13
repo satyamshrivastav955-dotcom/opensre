@@ -77,7 +77,7 @@ def test_metadata_is_a_mutating_action_tool_discovered_by_the_registry() -> None
     assert registered is not None
     assert tool.side_effect_level == "mutating"
     assert tool.surfaces == ("action",)
-    assert tool.requires_approval is True
+    assert tool.requires_approval is False
     assert tool.is_available({}) is True
 
 
@@ -310,13 +310,14 @@ def test_a_pull_request_is_merged_in_its_own_clone_not_in_the_current_directory(
     checkout = PullRequestCheckout(str(clone), "Acme", "widgets", 12, "feature", reused=False)
     asked: list[tuple[str, str]] = []
 
-    def checkout_pull_request(selector: str, *, cwd: str) -> PullRequestCheckout:
+    def checkout_pull_request(selector: str, *, cwd: str, token: str) -> PullRequestCheckout:
+        assert token == "app-token"
         asked.append((selector, cwd))
         return checkout
 
     # Act
     with patch(_CHECKOUT, checkout_pull_request):
-        out = resolve_merge_conflicts.run(pull_request="Acme/widgets#12")
+        out = resolve_merge_conflicts.run(pull_request="Acme/widgets#12", github_token="app-token")
 
     # Assert
     assert asked == [("Acme/widgets#12", str(elsewhere))]
@@ -333,13 +334,14 @@ def test_a_pull_request_that_cannot_be_checked_out_is_reported_without_a_merge(
     # Arrange
     monkeypatch.chdir(tmp_path)
 
-    def checkout_pull_request(selector: str, *, cwd: str) -> PullRequestCheckout:
+    def checkout_pull_request(selector: str, *, cwd: str, token: str) -> PullRequestCheckout:
         del selector, cwd
+        assert token == "app-token"
         raise GitCommandError("pr_not_found", "pull request 99 was not found; no push was made.")
 
     # Act
     with patch(_CHECKOUT, checkout_pull_request):
-        out = resolve_merge_conflicts.run(pull_request="99")
+        out = resolve_merge_conflicts.run(pull_request="99", github_token="app-token")
 
     # Assert
     assert out["success"] is False and out["error_kind"] == "pr_not_found"
@@ -381,3 +383,45 @@ def test_a_remote_whose_head_is_a_feature_branch_is_not_merged_by_default(tmp_pa
     assert out["success"] is False and out["error_kind"] == "no_merge_in_progress"
     assert "name the branch" in out["error"]
     assert head_sha(str(work)) == before
+
+
+def test_github_push_remote_cannot_use_local_credentials_from_a_non_github_origin(
+    tmp_path: Path,
+) -> None:
+    work = _diverged_repo(tmp_path)
+    _git(work, "config", "remote.origin.pushurl", "git@github.com:acme/app.git")
+    out = resolve_merge_conflicts.run(workspace=str(work))
+    assert out["work_outcome"]["status"] == "blocked"
+    assert "OpenSRE app" in out["response_text"]
+    assert not merge_in_progress(str(work))
+
+
+def test_selected_github_token_is_not_sent_to_another_push_host(tmp_path: Path) -> None:
+    work = _diverged_repo(tmp_path)
+    _git(work, "remote", "set-url", "origin", "https://github.com/acme/app.git")
+    _git(work, "config", "remote.origin.pushurl", "https://gitlab.com/acme/app.git")
+    out = resolve_merge_conflicts.run(workspace=str(work), github_token="app-token")
+    assert out["success"] is False
+    assert out["error_kind"] == "github_transport_mismatch"
+    assert not merge_in_progress(str(work))
+
+
+def test_local_relative_push_path_works_with_an_unrelated_app_connection(tmp_path: Path) -> None:
+    work = _stopped_merge(tmp_path)
+    (work / "repos").mkdir()
+    target = work / "repos" / "publish.git"
+    _git(work, "init", "--bare", str(target))
+    (work / ".git" / "info" / "exclude").write_text("repos/\n")
+    _git(work, "config", "remote.origin.pushurl", "repos/publish.git")
+
+    def resolve(_task: str, **_kwargs: object) -> CodingResult:
+        (work / "app.py").write_text("greeting = 'hi, world'\n")
+        return CodingResult(success=True, summary="Combined greetings")
+
+    with patch(_VERIFY, return_value=(True, "ready")), patch(_RUN, side_effect=resolve):
+        out = resolve_merge_conflicts.run(
+            workspace=str(work), github_token="app-token", wait_for_checks=False
+        )
+
+    assert out["success"] is True, out
+    assert _git(target, "rev-parse", "feature") == head_sha(str(work))

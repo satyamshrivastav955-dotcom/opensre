@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -10,6 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from config.constants.scheduler import WEEKDAY_CRON_FIELD
+from infrastructure.scheduling.scheduler.cron_expression import day_of_week_names
 from infrastructure.scheduling.scheduler.loop_constants import (
     LOOP_PROMPT_PARAM,
     LOOP_REPORT_ARGS_PARAM,
@@ -33,6 +35,8 @@ from integrations.github.tools.ci_analytics.working_hours import (
     local_timezone,
     local_working_hours,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_LOOP_TIME = "08:00"
 LOOP_WINDOW_DAYS = 7
@@ -92,6 +96,7 @@ def schedule_ci_reliability_loop(
     repo: str,
     *,
     time_text: str = DEFAULT_LOOP_TIME,
+    github_connection_id: str = "",
     weekdays: bool = True,
     timezone: str = "",
     store_path: Path | None = None,
@@ -105,7 +110,13 @@ def schedule_ci_reliability_loop(
     cannot parse.
     """
     prompt = loop_prompt(owner, repo)
-    report_args = {"owner": owner, "repo": repo, "days": str(LOOP_WINDOW_DAYS)}
+    report_args = {
+        "owner": owner,
+        "repo": repo,
+        "days": str(LOOP_WINDOW_DAYS),
+    }
+    if github_connection_id:
+        report_args["github_connection_id"] = github_connection_id
     existing = next(
         (
             task
@@ -115,7 +126,9 @@ def schedule_ci_reliability_loop(
         None,
     )
     if existing is not None:
-        if existing.params.get(LOOP_REPORT_PARAM) != REPORT_NAME:
+        if existing.params.get(LOOP_REPORT_PARAM) != REPORT_NAME or existing.params.get(
+            LOOP_REPORT_ARGS_PARAM
+        ) != json.dumps(report_args, sort_keys=True):
             existing.params[LOOP_REPORT_PARAM] = REPORT_NAME
             existing.params[LOOP_REPORT_ARGS_PARAM] = json.dumps(report_args, sort_keys=True)
             update_task(existing, store_path)
@@ -144,10 +157,19 @@ def build_report(args: Mapping[str, str], *, snapshot_dir: Path | None = None) -
 
     No model is involved, so every delivery carries the analytics header and
     the numbers can be traced back to the JSON snapshot named at the end.
-    Raises ``RuntimeError`` with a generic message when GitHub cannot be read.
+    When GitHub cannot be read, returns a blocked report naming what stopped
+    the read, never exception detail, so the loop's channels hear it.
+    Raises ``RuntimeError`` only for a loop without a repository or a token.
     """
-    from integrations.github.client import GitHubApiError, resolve_github_token
+    from integrations.github.client import (
+        GitHubApiError,
+        github_failure_kind,
+    )
     from integrations.github.tools.ci_analytics.analysis import analyze_repository
+    from integrations.github.tools.ci_analytics.failure import (
+        analysis_failure_report,
+        is_operational_failure,
+    )
     from integrations.github.tools.ci_analytics.payload import report_payload
     from integrations.github.tools.ci_analytics.render import headline, render_markdown
 
@@ -156,10 +178,14 @@ def build_report(args: Mapping[str, str], *, snapshot_dir: Path | None = None) -
     days = int(args.get("days", LOOP_WINDOW_DAYS) or LOOP_WINDOW_DAYS)
     if not owner or not repo:
         raise RuntimeError("The CI reliability loop needs owner and repo.")
-    token = resolve_github_token(None)
+    from integrations.github.app_connection import github_setup_url, refreshed_github_token
+
+    token = refreshed_github_token(args.get("github_connection_id"))
     if not token:
-        raise RuntimeError(
-            f"No GitHub token to read {owner}/{repo}; run `opensre integrations setup github`."
+        return TaskReport(
+            f"CI analysis blocked for {owner}/{repo}. Connect or reconnect GitHub in the OpenSRE app: {github_setup_url()}",
+            work_status="blocked",
+            error_kind="github_connection_required",
         )
     now = datetime.now(UTC)
     try:
@@ -167,7 +193,14 @@ def build_report(args: Mapping[str, str], *, snapshot_dir: Path | None = None) -
             owner, repo, token=token, days=days, working_hours=local_working_hours(), now=now
         )
     except (GitHubApiError, ValueError) as exc:
-        raise RuntimeError(f"Could not read the GitHub Actions history of {owner}/{repo}.") from exc
+        # Same split as the tool: GitHub, the network or the token is a
+        # warning without a stack; anything else is a fault worth one.
+        if is_operational_failure(exc):
+            kind = github_failure_kind(exc).value
+            logger.warning("CI reliability loop could not read %s/%s: %s", owner, repo, kind)
+        else:
+            logger.error("CI reliability loop could not read %s/%s", owner, repo, exc_info=exc)
+        return analysis_failure_report(exc, owner=owner, repo=repo, now=datetime.now(UTC))
     report = analysis.report
     snapshot = write_snapshot(
         snapshot_root(snapshot_dir),
@@ -196,11 +229,15 @@ def loop_card(scheduled: ScheduledLoop) -> LoopCard:
     """What the user is told about the loop: one headline and one fact per line."""
     task = scheduled.loop.task
     verb = "Already scheduled" if scheduled.reused else "Scheduled"
-    when = loop_time_label(task.cron) or task.cron
-    weekday_field = task.cron.split()[-1]
-    if weekday_field in {WEEKDAY_CRON_FIELD, "0-4"}:
+    # Empty unless the cron is five fields with a plain hour and minute.
+    when = loop_time_label(task.cron)
+    try:
+        days = day_of_week_names(task.cron.split()[-1])
+    except ValueError:
+        days = ""
+    if when and days == WEEKDAY_CRON_FIELD:
         schedule = f"weekdays at {when}"
-    elif weekday_field == "*":
+    elif when and days == "*":
         schedule = f"every day at {when}"
     else:
         schedule = f"on cron {task.cron}"

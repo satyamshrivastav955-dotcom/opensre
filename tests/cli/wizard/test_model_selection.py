@@ -143,3 +143,28 @@ class TestGpt56CatalogPresence:
         _wire_prompts(monkeypatch, select_values=["gpt-5.6-sol"])
 
         assert components.choose_model(provider, default="") == "gpt-5.6-sol"
+
+
+class TestGpt61CatalogPresence:
+    """The hosted default model stays selectable on the OpenAI-family pickers."""
+
+    def test_pickers_list_gpt_6_1_sol(self) -> None:
+        openai_values = {option.value for option in PROVIDER_BY_VALUE["openai"].models}
+        codex_values = {option.value for option in PROVIDER_BY_VALUE["codex"].models}
+        openrouter_values = {option.value for option in PROVIDER_BY_VALUE["openrouter"].models}
+        assert "gpt-6.1-sol" in openai_values
+        assert "gpt-6.1-sol" in codex_values
+        assert "openai/gpt-6.1-sol" in openrouter_values
+
+
+class TestClaudeNewModelsCatalogPresence:
+    """Onboarding must keep the Anthropic default and accept a curated 5.x pick."""
+
+    def test_anthropic_default_model_is_unchanged(self) -> None:
+        assert PROVIDER_BY_VALUE["anthropic"].default_model == "claude-opus-4-7"
+
+    def test_anthropic_picker_selects_sonnet_5_5(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        provider = PROVIDER_BY_VALUE["anthropic"]
+        _wire_prompts(monkeypatch, select_values=["claude-sonnet-5-5"])
+
+        assert components.choose_model(provider, default="") == "claude-sonnet-5-5"

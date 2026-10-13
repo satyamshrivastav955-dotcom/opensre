@@ -1,4 +1,4 @@
-"""Read the signed-in organization's OpenSRE hosted credit balance.
+"""Read the signed-in account scope's OpenSRE hosted credit balance.
 
 The ledger lives on the webapp. This module only reads it over the existing
 CLI bearer token — never a query parameter, never a shared fleet secret.
@@ -29,6 +29,9 @@ from config.constants.account import (
 )
 
 _CACHE_TTL_SEC = 5.0
+# A balance with credits left is reused for longer: every hosted LLM call checks
+# admission first, and the proxy still refuses an exhausted ledger with 402.
+_FUNDED_CACHE_TTL_SEC = 60.0
 _FALLBACK_TO_SESSION_STATUSES: frozenset[int] = frozenset(
     {
         HTTPStatus.FORBIDDEN,
@@ -54,7 +57,7 @@ class HostedCreditsKindValue(StrEnum):
 
 @dataclass(frozen=True)
 class AccountCredits:
-    """Spendable hosted credits for the signed-in organization."""
+    """Spendable hosted credits for the signed-in account scope."""
 
     total: int
     monthly: int | None
@@ -74,9 +77,16 @@ class HostedCreditsRead:
     usage_url: str | None = None
 
 
-_cache_key: tuple[str, str] | None = None
-_cache_read: HostedCreditsRead | None = None
-_cache_at: float = 0.0
+class _HostedCreditsCache:
+    """Last ledger read in this process.
+
+    Held on a class so the read is attribute access. A module global that is
+    only read inside a function declaring ``global`` is misreported as unused.
+    """
+
+    key: tuple[str, str] | None = None
+    read: HostedCreditsRead | None = None
+    at: float = 0.0
 
 
 def _nonneg_int(value: object) -> int | None:
@@ -244,38 +254,45 @@ def fetch_hosted_credits(*, app_url: str | None = None, fresh: bool = False) -> 
     """Read hosted credits without treating errors as a zero balance.
 
     A short in-process cache lets prompt assembly and LLM admission share one
-    HTTP read on the same turn.
+    HTTP read on the same turn; a read with credits left is kept for a minute,
+    so the model calls of one turn do not each wait on a fresh read.
     """
-    global _cache_key, _cache_read, _cache_at
     record = load_account_record()
     token = resolve_account_token()
     key = (token or "", (app_url or (record.app_url if record is not None else "")))
     now = time.monotonic()
+    cached = _HostedCreditsCache
     if (
         not fresh
-        and _cache_read is not None
-        and _cache_key == key
-        and now - _cache_at < _CACHE_TTL_SEC
+        and cached.read is not None
+        and cached.key == key
+        and now - cached.at < _cache_ttl(cached.read)
     ):
-        return _cache_read
+        return cached.read
     read = _read(app_url=app_url)
-    _cache_key = key
-    _cache_read = read
-    _cache_at = now
+    cached.key = key
+    cached.read = read
+    cached.at = now
     return read
+
+
+def _cache_ttl(read: HostedCreditsRead) -> float:
+    """How long ``read`` may answer: longer while credits remain, short otherwise."""
+    if read.credits is not None and read.credits.total > 0:
+        return _FUNDED_CACHE_TTL_SEC
+    return _CACHE_TTL_SEC
 
 
 def cached_hosted_credits() -> HostedCreditsRead | None:
     """Return the last ledger read in this process, or ``None`` if none yet."""
-    return _cache_read
+    return _HostedCreditsCache.read
 
 
 def reset_hosted_credits_cache() -> None:
     """Drop the in-process cache (tests)."""
-    global _cache_key, _cache_read, _cache_at
-    _cache_key = None
-    _cache_read = None
-    _cache_at = 0.0
+    _HostedCreditsCache.key = None
+    _HostedCreditsCache.read = None
+    _HostedCreditsCache.at = 0.0
 
 
 __all__ = [

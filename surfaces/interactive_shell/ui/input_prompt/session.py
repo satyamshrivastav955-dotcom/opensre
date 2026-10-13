@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.filters import Condition, has_completions, has_focus, is_done, to_filter
-from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.formatted_text import ANSI, FormattedText
 from prompt_toolkit.layout.containers import (
     AnyContainer,
     ConditionalContainer,
@@ -17,11 +17,13 @@ from prompt_toolkit.layout.containers import (
     Window,
     to_container,
 )
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu, MultiColumnCompletionsMenu
 
 from surfaces.interactive_shell.prompt_history import load_prompt_history
 from surfaces.interactive_shell.runtime import Session
+from surfaces.interactive_shell.ui.input_prompt.caret import ComposerCaret
 from surfaces.interactive_shell.ui.input_prompt.command_tray import CommandTrayControl
 from surfaces.interactive_shell.ui.input_prompt.completion import ShellCompleter
 from surfaces.interactive_shell.ui.input_prompt.frame import rounded_composer_frame
@@ -33,6 +35,7 @@ from surfaces.interactive_shell.ui.input_prompt.rendering import (
     resolve_prompt_placeholder,
 )
 from surfaces.interactive_shell.ui.input_prompt.style import _build_prompt_style
+from surfaces.interactive_shell.ui.transcript_view import TranscriptControl
 
 _COMPOSER_MAX_EDIT_ROWS = 8
 _COMPOSER_MIN_FRAME_ROWS = 3
@@ -53,6 +56,15 @@ def _limit_editable_height(main_input: HSplit) -> HSplit:
     # it changed). Window stores a Filter, not a raw bool — assign via to_filter.
     default_buffer_slot.content.height = Dimension(min=1, max=_COMPOSER_MAX_EDIT_ROWS)
     default_buffer_slot.content.dont_extend_height = to_filter(True)
+    default_buffer_slot.content.always_hide_cursor = to_filter(True)
+    buffer_control = default_buffer_slot.content.content
+    if not isinstance(buffer_control, BufferControl):
+        raise RuntimeError("prompt-toolkit input window is missing its buffer control")
+    processors = buffer_control.input_processors
+    if processors is None:
+        buffer_control.input_processors = [ComposerCaret()]
+    else:
+        processors.append(ComposerCaret())
     return HSplit(editable_children)
 
 
@@ -60,8 +72,19 @@ def _install_prompt_frame(
     session: PromptSession[str],
     *,
     hide_composer: Callable[[], bool] | None = None,
+    transcript: TranscriptControl | None = None,
+    status_line: Callable[[], str] | None = None,
 ) -> PromptSession[str]:
     """Wrap only the editable buffer, leaving live status rows above it.
+
+    ``status_line`` (when given) renders the permission/CI chrome on a fixed
+    row *under* the composer, so the transient region above the box can grow
+    and shrink without moving the settled chrome the user reads.
+
+    With ``transcript``, the prompt becomes a full-screen app: the transcript
+    fills the rows above the status line and is redrawn from its store at the
+    current width, so a resize never depends on how the terminal re-wrapped
+    earlier output.
 
     ``hide_composer`` (when given) collapses the composer box and its footer
     while structured input owns the keyboard (confirmation choice, option
@@ -81,6 +104,10 @@ def _install_prompt_frame(
 
     before_input = main_input.content.children[0]
     editable_body = _limit_editable_height(main_input.content)
+
+    def _live_region_width() -> int:
+        return prompt_line_width(session.app.output.get_size().columns)
+
     # Inner surface so the editable rows share INPUT_SURFACE with the border
     # (otherwise the frame looks hollow against the terminal bg).
     surface_body: AnyContainer = HSplit([editable_body], style="class:composer-body")
@@ -102,7 +129,7 @@ def _install_prompt_frame(
         composer_container = to_container(composer)
 
         def _current_composer_rows() -> int:
-            width = prompt_line_width()
+            width = _live_region_width()
             screen_rows = session.app.output.get_size().rows
             outside_rows = sum(
                 to_container(child).preferred_height(width, screen_rows).preferred
@@ -126,11 +153,32 @@ def _install_prompt_frame(
                 filter=~shown,
             ),
         ]
-    # Pack status + composer at the top of the live region (no JUSTIFY gap
-    # between Auto and the input box). Last column stays empty for wrap safety.
+    # Settled chrome sits under the box so the live region above can grow and
+    # shrink without shifting it. One row at any usable size: session state
+    # never changes its height, because a height that moves with state is what
+    # misplaces the cursor and strands stale status rows (the reason
+    # ``SpinnerState.toolbar_ansi`` stays empty). ``wrap_lines=False`` holds
+    # that when a narrow terminal would otherwise fold the row in two.
+    #
+    # ``min=0`` is required of every row added to this frame: under vertical
+    # pressure prompt_toolkit collapses this row rather than refusing to draw
+    # a short window ("Window too small"), which keeps the 3-row composer.
+    status_rows: list[AnyContainer] = []
+    if status_line is not None:
+        status_rows = [
+            Window(
+                FormattedTextControl(lambda: ANSI(status_line())),
+                height=Dimension(min=0, preferred=1, max=1),
+                dont_extend_height=True,
+                wrap_lines=False,
+                always_hide_cursor=True,
+            )
+        ]
+    # Pack status + composer at the full prompt width. Last column stays empty
+    # for wrap safety.
     chrome = HSplit(
-        [before_input, *box_rows],
-        width=prompt_line_width,
+        [before_input, *box_rows, *status_rows],
+        width=_live_region_width,
         align=VerticalAlign.TOP,
     )
     framed_input = FloatContainer(
@@ -153,10 +201,25 @@ def _install_prompt_frame(
     # (CPR ``_min_available_height`` = rows-below-cursor) stretches the live
     # region to the floor, scrolls the launch banner out of the viewport, and
     # parks Auto/composer at the bottom of a hollow terminal.
-    session.layout.container = HSplit(
-        [framed_input, *root.children[1:]],
-        align=VerticalAlign.TOP,
-    )
+    children: list[AnyContainer] = [framed_input, *root.children[1:]]
+    if transcript is not None:
+        children.insert(
+            0,
+            Window(
+                transcript,
+                # No preferred height: the control reports its own row count, so
+                # the composer sits under the last line until the transcript
+                # fills the screen. dont_extend_height keeps the leftover rows
+                # for the HSplit's TOP-alignment filler instead of this window.
+                height=Dimension(min=0),
+                dont_extend_height=True,
+                wrap_lines=False,
+                always_hide_cursor=True,
+            ),
+        )
+        session.app.full_screen = True
+        session.app.renderer.full_screen = True
+    session.layout.container = HSplit(children, align=VerticalAlign.TOP)
     return session
 
 
@@ -164,6 +227,8 @@ def build_prompt_session(
     session: Session | None = None,
     *,
     hide_composer: Callable[[], bool] | None = None,
+    transcript: TranscriptControl | None = None,
+    status_line: Callable[[], str] | None = None,
 ) -> PromptSession[str]:
     def _default_placeholder() -> FormattedText:
         from surfaces.interactive_shell.ui.input_prompt.rendering import (
@@ -189,8 +254,17 @@ def build_prompt_session(
             style=_build_prompt_style(),
             erase_when_done=True,
             placeholder=placeholder,
+            # Mouse reporting routes wheel notches to TranscriptControl.mouse_handler
+            # so the transcript scrolls. It also claims plain drag-select: hold
+            # Shift to select transcript text, the bypass every terminal honours.
+            # Without it the terminal falls back to alternate scroll and turns the
+            # wheel into Up keys, which recall history into the composer instead
+            # (see ``alternate_scroll``).
+            mouse_support=transcript is not None,
         ),
         hide_composer=hide_composer,
+        transcript=transcript,
+        status_line=status_line,
     )
 
 

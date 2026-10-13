@@ -149,12 +149,32 @@ _LOCAL_MODEL_PRICES: dict[str, ModelPrice] = {
     "gpt-5.6-sol": _price(5.00, 30.00, cache_read_usd_per_million=0.50),
     "gpt-5.6-terra": _price(2.50, 15.00, cache_read_usd_per_million=0.25),
     "gpt-5.6-luna": _price(1.00, 6.00, cache_read_usd_per_million=0.10),
+    # GPT-6.1 Sol. Per 1M tokens, from
+    # https://developers.openai.com/api/docs/models/gpt-6.1-sol: input 2,
+    # cached input 0.10, cache write 2.50, output 10.
+    "gpt-6.1-sol": _price(
+        2.00, 10.00, cache_read_usd_per_million=0.10, cache_write_usd_per_million=2.50
+    ),
     # claude-3-5-sonnet-20241022 — retired, frozen historical rate. litellm's
     # current table only keeps this generation under Bedrock-routed keys
     # (e.g. anthropic.claude-3-5-sonnet-20241022-v2:0), not the bare
     # direct-API id Claude Code CLI logs report.
     "claude-3-5-sonnet-20241022": _price(
         3.00, 15.00, cache_read_usd_per_million=0.30, cache_write_usd_per_million=3.75
+    ),
+    # Claude 5.x releases (September 2026) absent from litellm's bundled table.
+    # Per 1M tokens, from Anthropic pricing:
+    # Sonnet 5.5: 2.00 / 10.00, cache read 0.20, cache write 2.50.
+    # Opus 5.5: 4.00 / 20.00, cache read 0.40, cache write 5.00.
+    # Fable 5.1: 10.00 / 50.00, cache read 1.00, cache write 12.50.
+    "claude-sonnet-5-5": _price(
+        2.00, 10.00, cache_read_usd_per_million=0.20, cache_write_usd_per_million=2.50
+    ),
+    "claude-opus-5-5": _price(
+        4.00, 20.00, cache_read_usd_per_million=0.40, cache_write_usd_per_million=5.00
+    ),
+    "claude-fable-5-1": _price(
+        10.00, 50.00, cache_read_usd_per_million=1.00, cache_write_usd_per_million=12.50
     ),
 }
 
@@ -169,6 +189,12 @@ _LOCAL_FAMILY_FALLBACKS: tuple[tuple[str, str], ...] = tuple(
             ("gpt-5.6-luna", "gpt-5.6-luna"),
             # OpenAI routes the bare ``gpt-5.6`` alias to Sol server-side.
             ("gpt-5.6", "gpt-5.6-sol"),
+            ("gpt-6.1-sol", "gpt-6.1-sol"),
+            # Bare ``gpt-6.1`` follows the same alias rule as ``gpt-5.6`` → Sol.
+            ("gpt-6.1", "gpt-6.1-sol"),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("claude-opus-5-5", "claude-opus-5-5"),
+            ("claude-fable-5-1", "claude-fable-5-1"),
         ),
         key=lambda item: len(item[0]),
         reverse=True,

@@ -1,8 +1,4 @@
-"""Lightweight GitHub identity helpers for UI, analytics, and public sources.
-
-Kept separate from :mod:`integrations.github.login` so callers can read saved
-identity data or derive public repository scope without importing GitHub MCP.
-"""
+"""Read saved GitHub identity without running authentication."""
 
 from __future__ import annotations
 
@@ -36,6 +32,15 @@ def _workspace_repository_path(value: str) -> str:
             return ""
         return scp_match.group("path").strip("/")
     return value.strip("/")
+
+
+def is_github_remote_url(value: str) -> bool:
+    """Recognize a GitHub transport host, excluding bare names and local paths."""
+    if "://" in value:
+        parsed = urlsplit(value)
+        return (parsed.hostname or "").lower() in _GITHUB_HOSTS and parsed.scheme != "file"
+    match = _SCP_REPOSITORY_RE.fullmatch(value)
+    return match is not None and match.group("host").lower() in _GITHUB_HOSTS
 
 
 def workspace_public_repository_source(

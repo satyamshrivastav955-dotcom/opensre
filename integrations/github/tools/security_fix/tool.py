@@ -8,7 +8,11 @@ from core.agent_harness.tools import action_context_from_agent_context
 from core.domain.types.tools import ToolSurface
 from core.tool import SideEffectLevel
 from core.tool_framework import tool
-from integrations.github.client import resolve_github_token
+from integrations.github.agent_tools import (
+    github_tool_available,
+    github_tool_params,
+    require_webapp_github,
+)
 from integrations.github.helpers import (
     GITHUB_INJECTED_PARAMS,
     github_creds,
@@ -59,6 +63,10 @@ _INPUT_SCHEMA: dict[str, Any] = {
             "type": "boolean",
             "description": "True when the user asks to raise/open a pull request or ship the fix.",
         },
+        "quality_only": {
+            "type": "boolean",
+            "description": "Fix only findings without a security severity; use for unattended loops on public repositories.",
+        },
         "github_token": {
             "type": "string",
             "description": "GitHub token injected from the configured integration.",
@@ -69,12 +77,7 @@ _INPUT_SCHEMA: dict[str, Any] = {
 
 
 def _github_security_fix_available(sources: dict[str, dict]) -> bool:
-    gh = sources.get("github", {})
-    return bool(
-        github_source_available(sources)
-        or resolve_github_token(None)
-        or github_creds(gh).get("github_token")
-    )
+    return github_source_available(sources)
 
 
 def _github_security_fix_extract_params(sources: dict[str, dict]) -> dict[str, Any]:
@@ -128,14 +131,13 @@ def _confirm_fn(context: Any) -> Any:
     ],
     surfaces=(ToolSurface.ACTION,),
     side_effect_level=SideEffectLevel.MUTATING,
-    requires_approval=True,
-    approval_reason=("Edits files and can push a branch and open a GitHub PR."),
     accepts_runtime_context=True,
     input_schema=_INPUT_SCHEMA,
-    is_available=_github_security_fix_available,
-    extract_params=_github_security_fix_extract_params,
+    is_available=github_tool_available(_github_security_fix_available),
+    extract_params=github_tool_params(_github_security_fix_extract_params),
     injected_params=GITHUB_INJECTED_PARAMS,
 )
+@require_webapp_github
 def fix_github_security_alert(
     owner: str | None = None,
     repo: str | None = None,
@@ -145,6 +147,7 @@ def fix_github_security_alert(
     workspace: str | None = None,
     model: str | None = None,
     open_pr: bool = False,
+    quality_only: bool = False,
     github_token: str | None = None,
     context: Any = None,
     **_kwargs: Any,
@@ -159,6 +162,7 @@ def fix_github_security_alert(
         workspace=workspace,
         model=model,
         open_pr=open_pr,
+        quality_only=quality_only,
         github_token=github_token,
         confirm_fn=_confirm_fn(context),
     )

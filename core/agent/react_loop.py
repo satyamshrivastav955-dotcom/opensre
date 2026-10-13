@@ -11,12 +11,20 @@ host can drive it. ``run_react_loop`` is the one-line functional entry.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import Any
 
+from config.constants.tool_discovery import (
+    DISCOVERY_DETAIL_KEYS_KEY,
+    DISCOVERY_PROGRESS_KEY,
+    MAX_STAGNANT_DISCOVERY_ITERATIONS,
+    MODEL_ONLY_PRESENTATION_KEY,
+)
+from config.llm_models import DEFAULT_MAX_TOKENS
 from core.agent.cancel import tool_resources_cancel_requested
 from core.agent.loop_host import LoopHost
 from core.agent.run_io import AgentRunInput, AgentRunResult
@@ -67,6 +75,7 @@ from infrastructure.observability.trace.observations import (
 )
 from infrastructure.observability.trace.redaction import redact_sensitive
 from infrastructure.observability.trace.spans import (
+    is_session_trace_active,
     llm_span,
     loop_iteration_span,
     loop_span,
@@ -85,12 +94,19 @@ _GENERATION_OBSERVATION_NAME = "think"
 _OVERFLOW_RETRY_BUDGET_FACTOR = 0.6
 _OVERFLOW_RETRY_MIN_MESSAGE_TOKENS = 4_000
 
+# The budget estimates tokens from characters on purpose high. After each call
+# the ceiling is corrected by the provider's own count, within these bounds, so
+# a request is not trimmed at half the real window.
+_MIN_TOKEN_SCALE = 0.25
+_MAX_TOKEN_SCALE = 1.5
+_MAX_CEILING_STRETCH = 3.0
+
 _SAFETY_HANDOFF_PROMPT = """\
 The tool loop has stopped for safety ({reason}). Tools are disabled for this response.
 Give the user a concise final handoff based only on the work and tool results above:
 summarize useful partial results, state what prevented completion, and give the next
 practical step. Do not claim the task completed and do not request or describe another
-tool call.
+tool call. Do not quote, list, or summarize model-only discovery results.
 """
 _ITERATION_CAP_FALLBACK = (
     "I reached the emergency tool-iteration ceiling. Partial results are preserved, "
@@ -100,6 +116,10 @@ _STAGNATION_FALLBACK = (
     "I stopped after repeated tool calls produced no new result. Partial results are "
     "preserved, but I could not complete the request. Change the inputs or tool strategy "
     "before continuing."
+)
+_DISCOVERY_STAGNATION_FALLBACK = (
+    "I stopped after repeated tool discovery found no new capability or guidance. "
+    "I could not complete the request with the available tools."
 )
 _GOAL_UNVERIFIED_FALLBACK = (
     "I could not verify that the requested outcome was achieved. Partial results are "
@@ -151,6 +171,32 @@ def _observation_fingerprint(
     return digest.digest()
 
 
+_CALL_USAGE_FIELDS = ("input_tokens", "cache_read_tokens", "output_tokens", "reasoning_tokens")
+
+
+def _record_call_usage(span_attrs: dict[str, Any], response: Any) -> None:
+    """Put the provider-reported usage of one model call on its trace span.
+
+    The span lands in the session log, which makes the per-call prompt-cache
+    hit rate and reasoning spend readable after the fact. Fields the provider
+    did not report stay off the span rather than reading as 0.
+    """
+    for name in _CALL_USAGE_FIELDS:
+        value = getattr(response, name, None)
+        if isinstance(value, int):
+            span_attrs[name] = value
+
+
+def _traced_exception_message(exc: BaseException) -> str | None:
+    """Redacted, capped exception text for an error span; ``None`` when nothing is traced."""
+    if not is_session_trace_active():
+        return None
+    # Deferred: only a failed run that is being traced needs the analytics redactor.
+    from infrastructure.analytics.event_properties import bounded_error_message
+
+    return bounded_error_message(exc) or None
+
+
 @dataclass(frozen=True, slots=True)
 class _IterationResult:
     """Outcome summary for one loop iteration."""
@@ -192,7 +238,15 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
         )
         self._runtime_tools = list(host._filter_tools(initial_tools))
         self._tool_schemas = self._llm.tool_schemas(self._runtime_tools)
-        self._ceiling = context_budget_ceiling_for_model(getattr(self._llm, "_model", None))
+        max_output_tokens = getattr(self._llm, "_max_tokens", DEFAULT_MAX_TOKENS)
+        if not isinstance(max_output_tokens, int):
+            max_output_tokens = DEFAULT_MAX_TOKENS
+        self._ceiling = context_budget_ceiling_for_model(
+            getattr(self._llm, "_model", None), max_output_tokens=max_output_tokens
+        )
+        # Provider-counted tokens per estimated token, learned from the last call.
+        self._token_scale = 1.0
+        self._calibrate_budget = True
         # Recompute only when the host changes the available tools.
         self._fixed_overhead_tokens = system_and_tools_overhead(self._system, self._tool_schemas)
         self._executed: list[tuple[ToolCall, Any]] = []
@@ -204,11 +258,13 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
         self._cancelled = False
         self._iterations_used = 0
         # Provider-reported usage summed over every model call of this run.
-        self._input_tokens = 0
-        self._output_tokens = 0
+        self._input_tokens: int | None = 0
+        self._output_tokens: int | None = 0
         self._stop_reason = "iteration_cap"
         self._seen_observations: set[bytes] = set()
         self._stagnant_iterations = 0
+        self._stagnant_discovery_iterations = 0
+        self._seen_discovery_details: set[str] = set()
         self._safety_handoff_attempted = False
         self._operation_run_id = uuid.uuid4().hex[:12]
 
@@ -224,6 +280,7 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
             )
         )
         self._record_loop_operation("agent_loop_started")
+        self._record_catalog_snapshot(reason="initial")
         with (
             observe_agent(
                 _AGENT_OBSERVATION_NAME,
@@ -294,6 +351,7 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
         self._runtime_tools = list(self._host._filter_tools(list(snapshot)))
         self._tool_schemas = self._llm.tool_schemas(self._runtime_tools)
         self._fixed_overhead_tokens = system_and_tools_overhead(self._system, self._tool_schemas)
+        self._record_catalog_snapshot(reason="expanded")
 
     def _run_iteration(self, iteration: int) -> _IterationResult:
         """Run one think -> observe step."""
@@ -315,6 +373,7 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
                     "error",
                     error=True,
                     exception_type=type(exc).__name__,
+                    exception_message=_traced_exception_message(exc),
                     message_count=len(self._messages),
                     executed_count=len(self._executed),
                 )
@@ -394,10 +453,10 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
         request_tools = self._tool_schemas if tool_schemas is None else tool_schemas
         transformed_messages = self._host._transform_messages(self._messages)
         llm_messages = self._host._convert_to_llm(self._llm, transformed_messages)
-        enforce_context_budget(
+        estimated_tokens = enforce_context_budget(
             llm_messages,
             fixed_overhead_tokens=self._fixed_overhead_tokens,
-            ceiling=self._ceiling,
+            ceiling=self._effective_ceiling(),
         )
         provider_request = ProviderRequest(
             messages=llm_messages,
@@ -452,6 +511,7 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
             span_attrs["has_tool_calls"] = response.has_tool_calls
             span_attrs["tool_call_count"] = len(response.tool_calls)
             span_attrs["content_chars"] = len(response.content or "")
+            _record_call_usage(span_attrs, response)
             if is_observation_sink_active():
                 generation.update(
                     output=generation_output(response),
@@ -463,11 +523,20 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
                     ),
                     metadata={"stop_reason": str(getattr(response, "stop_reason", "") or "")},
                 )
-        input_tokens = int(getattr(response, "input_tokens", 0) or 0)
-        output_tokens = int(getattr(response, "output_tokens", 0) or 0)
+        input_tokens = getattr(response, "input_tokens", None)
+        output_tokens = getattr(response, "output_tokens", None)
         cache_read_tokens = int(getattr(response, "cache_read_tokens", 0) or 0)
-        self._input_tokens += input_tokens
-        self._output_tokens += output_tokens
+        self._calibrate(estimated_tokens, input_tokens)
+        self._input_tokens = (
+            self._input_tokens + input_tokens
+            if self._input_tokens is not None and input_tokens is not None
+            else None
+        )
+        self._output_tokens = (
+            self._output_tokens + output_tokens
+            if self._output_tokens is not None and output_tokens is not None
+            else None
+        )
         response = self._host._after_response(provider_request, response)
         self._host._emit_runtime(
             ProviderRequestEndEvent(
@@ -486,6 +555,20 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
         )
         return response
 
+    def _effective_ceiling(self) -> int:
+        """The budget in estimated tokens, corrected by the provider's last count."""
+        stretched = self._ceiling / self._token_scale
+        return int(min(stretched, self._ceiling * _MAX_CEILING_STRETCH))
+
+    def _calibrate(self, estimated_tokens: int, input_tokens: Any) -> None:
+        """Learn how the estimate compares with what the provider counted."""
+        if not self._calibrate_budget or estimated_tokens <= 0:
+            return
+        if not isinstance(input_tokens, int) or input_tokens <= 0:
+            return
+        scale = input_tokens / estimated_tokens
+        self._token_scale = min(max(scale, _MIN_TOKEN_SCALE), _MAX_TOKEN_SCALE)
+
     def _invoke_within_budget(self, provider_request: ProviderRequest) -> Any:
         """Call the model; on a size rejection, shrink the budget and retry once.
 
@@ -503,6 +586,10 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
         except Exception as exc:
             if not is_context_length_overflow(str(exc)):
                 raise
+            # The provider refused a request the corrected budget allowed, so
+            # stop correcting and fall back to the conservative estimate.
+            self._calibrate_budget = False
+            self._token_scale = 1.0
             estimated = (
                 estimate_message_tokens(provider_request.messages) + self._fixed_overhead_tokens
             )
@@ -600,15 +687,20 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
     def _observe(self, response: Any, assistant_message: Any, iteration: int) -> _IterationResult:
         """Execute the requested tools, record results, and emit events."""
         requested_tool_count = len(response.tool_calls)
-        for index, tc in enumerate(response.tool_calls):
+        index_by_call_id = {tc.id: index for index, tc in enumerate(response.tool_calls)}
+
+        def on_call_start(tc: Any, *, event_iteration: int = iteration) -> None:
+            # Emitted immediately before the call runs (not up front for the
+            # whole batch) so a durable intent record never covers a call a
+            # crash or an earlier turn-ending result kept from starting.
             self._host._emit_runtime(
                 ToolExecutionStartEvent(
                     tool_call_id=tc.id,
                     tool_name=tc.name,
                     args=public_tool_input(tc.input),
-                    iteration=iteration,
+                    iteration=event_iteration,
                     data={
-                        "tool_call_index": index,
+                        "tool_call_index": index_by_call_id.get(tc.id, 0),
                         "tool_call_count": requested_tool_count,
                     },
                 )
@@ -634,18 +726,39 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
             self._resolved,
             hooks=hooks,
             tool_resources=self._tool_resources,
+            should_stop=self._cancel_requested,
+            on_call_start=on_call_start,
+            iteration=iteration,
         )
         provider_results = [result.provider_content() for result in results]
         tool_result_message = self._msg_formatter.to_tool_result_runtime_message(
             response.tool_calls, provider_results
         )
+        model_only_indices = tuple(
+            index for index, result in enumerate(results) if result.model_only
+        )
+        if model_only_indices:
+            tool_result_message = replace(
+                tool_result_message,
+                metadata={
+                    **tool_result_message.metadata,
+                    "model_only_result_indices": model_only_indices,
+                },
+            )
         self._messages.append(tool_result_message)
 
         tool_error_count = sum(1 for result in results if result.is_error)
         terminated_tool_count = sum(1 for result in results if result.terminate)
         for index, (tc, result) in enumerate(zip(response.tool_calls, results, strict=True)):
             compat_payload = result.compat_payload()
-            self._executed.append((tc, compat_payload))
+            # A call skipped after an earlier call ended the turn never ran:
+            # it answers the provider's tool-call id but is not evidence.
+            skipped = bool(result.metadata.get("skipped"))
+            # Successful discovery stays out of the work record. A failed
+            # model-only call, such as skill_view(reference=...), is still work
+            # the goal gate has to see.
+            if not skipped and (not result.model_only or result.is_error):
+                self._executed.append((tc, compat_payload))
             self._tool_results.append((tc, result))
             self._host._emit_runtime(
                 ToolExecutionEndEvent(
@@ -659,6 +772,8 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
                         "terminate": result.terminate,
                         "tool_call_index": index,
                         "tool_call_count": requested_tool_count,
+                        **({"skipped": True} if skipped else {}),
+                        **({MODEL_ONLY_PRESENTATION_KEY: True} if result.model_only else {}),
                     },
                 )
             )
@@ -672,6 +787,11 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
                     "tool_call_count": requested_tool_count,
                     "tool_error_count": tool_error_count,
                     "terminated_tool_count": terminated_tool_count,
+                    **(
+                        {"model_only_result_indices": model_only_indices}
+                        if model_only_indices
+                        else {}
+                    ),
                 },
             )
         )
@@ -685,6 +805,31 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
                 requested_tool_count=requested_tool_count,
                 tool_error_count=tool_error_count,
                 terminated_tool_count=terminated_tool_count,
+            )
+        discovery_only = bool(results) and all(result.model_only for result in results)
+        if discovery_only:
+            detail_keys = {
+                str(key)
+                for result in results
+                for key in result.metadata.get(DISCOVERY_DETAIL_KEYS_KEY, ())
+            }
+            made_progress = bool(detail_keys - self._seen_discovery_details) or any(
+                result.metadata.get(DISCOVERY_PROGRESS_KEY) is True for result in results
+            )
+            self._seen_discovery_details.update(detail_keys)
+            self._stagnant_discovery_iterations = (
+                0 if made_progress else self._stagnant_discovery_iterations + 1
+            )
+        else:
+            self._stagnant_discovery_iterations = 0
+        if self._stagnant_discovery_iterations >= MAX_STAGNANT_DISCOVERY_ITERATIONS:
+            self._stop_reason = "discovery_stagnation"
+            return _IterationResult(
+                should_stop=True,
+                outcome=self._stop_reason,
+                requested_tool_count=requested_tool_count,
+                tool_error_count=tool_error_count,
+                terminated_tool_count=0,
             )
         fingerprint = _observation_fingerprint(response.tool_calls, results)
         if fingerprint in self._seen_observations:
@@ -778,6 +923,8 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
             if self._stop_reason == "stagnation_limit"
             else _ITERATION_CAP_FALLBACK
         )
+        if self._stop_reason == "discovery_stagnation":
+            content = _DISCOVERY_STAGNATION_FALLBACK
         if self._stop_reason == "goal_unverified":
             content = _GOAL_UNVERIFIED_FALLBACK
         return AssistantRuntimeMessage(
@@ -827,10 +974,11 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
             terminated_by_tool=self._terminated_by_tool,
             cancelled=self._cancelled,
             hit_iteration_cap=self._hit_cap,
+            stop_reason=self._stop_reason,
             llm_iterations_used=self._iterations_used,
             final_system_prompt=self._final_system_prompt,
-            input_tokens=self._input_tokens,
-            output_tokens=self._output_tokens,
+            input_tokens=self._input_tokens if self._iterations_used else None,
+            output_tokens=self._output_tokens if self._iterations_used else None,
         )
         self._host._emit_runtime(
             AgentEndEvent(
@@ -922,8 +1070,8 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
             "cancelled": self._cancelled,
             "safety_handoff_attempted": self._safety_handoff_attempted,
             "tool_call_count": len(self._executed),
-            # Token totals are deliberately absent: Langfuse sums generation
-            # usage per trace, and a ``*_tokens`` key would be key-redacted.
+            # Token totals belong on generation observations, not agent metadata;
+            # a ``*_tokens`` metadata key would also be key-redacted.
         }
 
     def _mark_loop_error(self, span_attrs: dict[str, Any], exc: BaseException) -> None:
@@ -933,6 +1081,7 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
             error=True,
             stop_reason=self._stop_reason,
             exception_type=type(exc).__name__,
+            exception_message=_traced_exception_message(exc),
             iterations_used=self._iterations_used,
             max_iterations=self._max_iterations,
             message_count=len(self._messages),
@@ -946,6 +1095,23 @@ class ReactLoop[RuntimeToolT: RuntimeTool]:
         data: dict[str, Any] | None = None,
     ) -> None:
         record_operation(event, {**self._operation_base(), **(data or {})})
+
+    def _record_catalog_snapshot(self, *, reason: str) -> None:
+        """Record catalog shape without tool descriptions or schemas."""
+        serialized_bytes = len(
+            json.dumps(self._tool_schemas, ensure_ascii=False, default=str).encode("utf-8")
+        )
+        self._record_loop_operation(
+            "tool_catalog_snapshot",
+            {
+                "reason": reason,
+                "catalog_names": [
+                    str(getattr(tool, "name", "tool")) for tool in self._runtime_tools
+                ],
+                "serialized_size_bytes": serialized_bytes,
+                "schema_tokens": system_and_tools_overhead(None, self._tool_schemas),
+            },
+        )
 
     def _record_loop_finished(self, *, error: BaseException | None = None) -> None:
         data: dict[str, Any] = {

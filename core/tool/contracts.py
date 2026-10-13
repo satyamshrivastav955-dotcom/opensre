@@ -15,6 +15,7 @@ from typing import Any, ClassVar, TypeAlias, Union, cast, get_args, get_origin, 
 
 from pydantic import BaseModel, Field, field_validator
 
+from config.constants.tool_params import config_only_params
 from config.constants.tooling import DEFAULT_APPROVAL_EXPIRY_SECONDS
 from config.strict_config import StrictConfigModel
 from core.domain.types.evidence import EvidenceMapper, EvidenceSource
@@ -160,6 +161,92 @@ def _value_matches_schema(value: Any, schema: dict[str, Any]) -> bool:
     return True
 
 
+# Validation messages go back to the model and onto analytics; they name schema
+# facts and argument *names* only, never a value the model sent.
+_MAX_LISTED_NAMES = 12
+
+
+def _listed(names: Sequence[Any]) -> str:
+    shown = ", ".join(str(name) for name in names[:_MAX_LISTED_NAMES])
+    return f"{shown}, …" if len(names) > _MAX_LISTED_NAMES else shown
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    for schema_type in ("boolean", "integer", "number", "string", "array", "object"):
+        if _json_type_matches(value, schema_type):
+            return schema_type
+    return type(value).__name__
+
+
+def _invalid_value_hint(value: Any, schema: dict[str, Any]) -> str:
+    """Say what a rejected argument should have been, from the schema alone."""
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum and isinstance(value, str) and value not in enum:
+        words = value.split(maxsplit=1)
+        if len(words) == 2 and words[0] in enum:
+            return (
+                f"expected exactly one allowed value; {words[0]!r} is allowed, "
+                "so pass the words after it as separate arguments"
+            )
+        return f"expected one of: {_listed(enum)}"
+    expected = schema.get("type")
+    if not isinstance(expected, str) or _json_type_matches(value, expected):
+        return ""
+    hint = f"expected {expected}, got {_json_type_name(value)}"
+    if expected in {"array", "object"} and isinstance(value, str):
+        hint += f" (send a JSON {expected}, not a string)"
+    return hint
+
+
+def _public_input_error(name: str, schema: dict[str, Any], payload: Any) -> str | None:
+    """Return why ``payload`` does not fit tool ``name``'s public ``schema``, or ``None``."""
+    if schema.get("type") != "object":
+        return f"{name} exposes a non-object input schema."
+    if not isinstance(payload, dict):
+        return f"{name} expected object input."
+
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    required = schema.get("required")
+    if not isinstance(required, list):
+        required = []
+    known = list(properties)
+    unexpected = sorted(key for key in payload if key not in properties)
+
+    missing = [arg for arg in required if arg not in payload]
+    if missing:
+        message = f"{name} missing required args: {', '.join(sorted(missing))}."
+        if not payload:
+            return (
+                f"{message} The call carried no arguments (empty, or not a valid JSON "
+                "object); resend it with every required arg."
+            )
+        if unexpected:
+            return (
+                f"{message} Unknown args received: {_listed(unexpected)}; "
+                f"this tool's args are: {_listed(known)}."
+            )
+        return message
+
+    if schema.get("additionalProperties") is False and unexpected:
+        return (
+            f"{name} got unexpected args: {_listed(unexpected)}. "
+            f"This tool's args are: {_listed(known)}."
+        )
+
+    for key, value in payload.items():
+        prop_schema = properties.get(key)
+        if not isinstance(prop_schema, dict):
+            continue
+        if not _value_matches_schema(value, prop_schema):
+            hint = _invalid_value_hint(value, prop_schema)
+            return f"{name}.{key} has invalid type/value" + (f": {hint}." if hint else ".")
+    return None
+
+
 _TOOL_LOGGER = logging.getLogger("tools")
 
 
@@ -212,6 +299,7 @@ class ToolMetadata(StrictConfigModel):
 
     name: str
     description: str
+    compact_description: str | None = None
     display_name: str | None = None
     input_schema: dict[str, Any]
     source: EvidenceSource
@@ -230,7 +318,7 @@ class ToolMetadata(StrictConfigModel):
         description="Declares which structured retrieval controls this tool supports",
     )
 
-    @field_validator("name", "description", "display_name")
+    @field_validator("name", "description", "compact_description", "display_name")
     @classmethod
     def _require_non_empty_strings(cls, value: str | None) -> str | None:
         if value is None:
@@ -265,6 +353,7 @@ class BaseTool(ABC):
 
     name: ClassVar[str]
     description: ClassVar[str]
+    compact_description: ClassVar[str | None] = None
     display_name: ClassVar[str | None] = None
     input_schema: ClassVar[dict[str, Any]]  # JSON Schema — consumed by LLM planner
     input_model: ClassVar[type[BaseModel] | None] = None
@@ -298,6 +387,7 @@ class BaseTool(ABC):
         metadata = cls.metadata()
         cls.name = metadata.name
         cls.description = metadata.description
+        cls.compact_description = metadata.compact_description
         cls.display_name = metadata.display_name
         cls.input_schema = metadata.input_schema
         cls.source = metadata.source
@@ -324,6 +414,7 @@ class BaseTool(ABC):
             {
                 "name": getattr(cls, "name", ""),
                 "description": getattr(cls, "description", ""),
+                "compact_description": getattr(cls, "compact_description", None),
                 "display_name": getattr(cls, "display_name", None),
                 "input_schema": getattr(cls, "input_schema", {}),
                 "source_id": getattr(cls, "source_id", None),
@@ -371,6 +462,13 @@ class BaseTool(ABC):
 
 
 REGISTERED_TOOL_ATTR = "__opensre_registered_tool__"
+#: ``error_kind`` of a result whose tool refused the request on its own rules.
+#: The integration behind such a tool is healthy; its credential needs no change.
+ERROR_KIND_REFUSED = "refused"
+#: Result ``details`` key a tool sets when one call did less than its declared
+#: ``side_effect_level`` (a read through a tool declared mutating); the value is
+#: a :class:`SideEffectLevel` value.
+CALL_SIDE_EFFECT_LEVEL_KEY = "side_effect_level"
 
 _DEFAULT_SURFACES: tuple[ToolSurface, ...] = (ToolSurface.CHAT,)
 
@@ -397,6 +495,7 @@ class RegisteredTool:
     input_schema: dict[str, Any]
     source: EvidenceSource
     run: Callable[..., Any] = field(repr=False)
+    compact_description: str | None = None
     display_name: str | None = None
     source_id: str | None = None
     evidence_type: EvidenceType | None = None
@@ -436,6 +535,7 @@ class RegisteredTool:
             {
                 "name": self.name,
                 "description": self.description,
+                "compact_description": self.compact_description,
                 "display_name": self.display_name,
                 "input_schema": self.input_schema,
                 "source": self.source,
@@ -454,6 +554,7 @@ class RegisteredTool:
         )
         self.name = metadata.name
         self.description = metadata.description
+        self.compact_description = metadata.compact_description
         self.display_name = metadata.display_name
         self.input_schema = metadata.input_schema
         self.source = metadata.source
@@ -489,16 +590,17 @@ class RegisteredTool:
     def _public_input_schema(self) -> dict[str, Any]:
         """Deepcopy + prune injected params once; the shared cache behind
         ``public_input_schema``. ``input_schema`` / ``injected_params`` are fixed
-        at construction, so this is invariant."""
+        at construction, so this is invariant. Config-only names are hidden too."""
         schema = deepcopy(self.input_schema)
         properties = schema.get("properties")
         if not isinstance(properties, dict):
             return schema
-        for injected in self.injected_params:
-            properties.pop(injected, None)
+        hidden = config_only_params(self.name, self.injected_params)
+        for name in hidden:
+            properties.pop(name, None)
         required = schema.get("required")
         if isinstance(required, list):
-            schema["required"] = [name for name in required if name not in self.injected_params]
+            schema["required"] = [name for name in required if name not in hidden]
         return schema
 
     @property
@@ -513,35 +615,7 @@ class RegisteredTool:
 
     def validate_public_input(self, payload: dict[str, Any]) -> str | None:
         """Validate model-provided input against this tool's public schema."""
-        schema = self.public_input_schema
-        if schema.get("type") != "object":
-            return f"{self.name} exposes a non-object input schema."
-        if not isinstance(payload, dict):
-            return f"{self.name} expected object input."
-
-        properties = schema.get("properties")
-        if not isinstance(properties, dict):
-            properties = {}
-        required = schema.get("required")
-        if not isinstance(required, list):
-            required = []
-
-        missing = [name for name in required if name not in payload]
-        if missing:
-            return f"{self.name} missing required args: {', '.join(sorted(missing))}."
-
-        if schema.get("additionalProperties") is False:
-            extra = sorted(name for name in payload if name not in properties)
-            if extra:
-                return f"{self.name} got unexpected args: {', '.join(extra)}."
-
-        for key, value in payload.items():
-            prop_schema = properties.get(key)
-            if not isinstance(prop_schema, dict):
-                continue
-            if not _value_matches_schema(value, prop_schema):
-                return f"{self.name}.{key} has invalid type/value."
-        return None
+        return _public_input_error(self.name, self.public_input_schema, payload)
 
     def __call__(self, **kwargs: Any) -> Any:
         return _invoke_tool(self.run, name=self.name, source=str(self.source), kwargs=kwargs)
@@ -551,6 +625,7 @@ class RegisteredTool:
         cls,
         tool: BaseTool,
         *,
+        compact_description: str | None = None,
         surfaces: Iterable[ToolSurface] | None = None,
         retrieval_controls: RetrievalControls | None = None,
         tags: tuple[str, ...] | None = None,
@@ -578,6 +653,11 @@ class RegisteredTool:
         return cls(
             name=metadata.name,
             description=metadata.description,
+            compact_description=(
+                compact_description
+                if compact_description is not None
+                else metadata.compact_description
+            ),
             display_name=metadata.display_name,
             input_schema=resolved_input_schema,
             source=metadata.source,
@@ -632,6 +712,7 @@ class RegisteredTool:
         *,
         name: str | None = None,
         description: str | None = None,
+        compact_description: str | None = None,
         display_name: str | None = None,
         input_schema: dict[str, Any] | None = None,
         input_model: type[BaseModel] | None = None,
@@ -674,6 +755,7 @@ class RegisteredTool:
         return cls(
             name=name or func.__name__,
             description=description or inferred_description,
+            compact_description=compact_description,
             display_name=display_name,
             input_schema=resolved_input_schema,
             source=source,
@@ -750,35 +832,7 @@ class AgentTool:
         return self.input_schema
 
     def validate_public_input(self, payload: dict[str, Any]) -> str | None:
-        schema = self.public_input_schema
-        if schema.get("type") != "object":
-            return f"{self.name} exposes a non-object input schema."
-        if not isinstance(payload, dict):
-            return f"{self.name} expected object input."
-
-        properties = schema.get("properties")
-        if not isinstance(properties, dict):
-            properties = {}
-        required = schema.get("required")
-        if not isinstance(required, list):
-            required = []
-
-        missing = [name for name in required if name not in payload]
-        if missing:
-            return f"{self.name} missing required args: {', '.join(sorted(missing))}."
-
-        if schema.get("additionalProperties") is False:
-            extra = sorted(name for name in payload if name not in properties)
-            if extra:
-                return f"{self.name} got unexpected args: {', '.join(extra)}."
-
-        for key, value in payload.items():
-            prop_schema = properties.get(key)
-            if not isinstance(prop_schema, dict):
-                continue
-            if not _value_matches_schema(value, prop_schema):
-                return f"{self.name}.{key} has invalid type/value."
-        return None
+        return _public_input_error(self.name, self.public_input_schema, payload)
 
 
 # Keep this as an assignment-style alias for the same CodeQL export check.
@@ -789,6 +843,8 @@ __all__ = [
     "AgentToolContext",
     "AgentToolExecutor",
     "BaseTool",
+    "CALL_SIDE_EFFECT_LEVEL_KEY",
+    "ERROR_KIND_REFUSED",
     "EvidenceType",
     "REGISTERED_TOOL_ATTR",
     "RegisteredTool",

@@ -8,8 +8,10 @@ from rich.console import Console
 from rich.markup import escape
 
 from config.constants.llm import LLM_PROVIDER_ENV
+from core.agent_harness.spi.session_state import exclusive_stdin_active
 from surfaces.interactive_shell.command_registry.model.presentation import render_current_models
 from surfaces.interactive_shell.command_registry.model.switching import (
+    _account_model_change_is_locked,
     _provider_allows_custom_models,
     restore_default_model,
     switch_llm_provider,
@@ -26,12 +28,22 @@ from surfaces.shared.llm_setup.provider_choices import (
 )
 from surfaces.shared.terminal.components.choice_menu import (
     CRUMB_SEP,
+    print_valid_choice_list,
     repl_choose_one,
     repl_section_break,
     repl_tty_interactive,
 )
+from surfaces.shared.terminal.components.subcommand_menu import repl_choose_subcommand
 
 _ROOT = "/model"  # breadcrumb root label
+
+_MODEL_FIRST_ARGS: tuple[tuple[str, str], ...] = (
+    ("show", "show active provider and models"),
+    ("set", "switch provider  ·  /model set <provider> [model]"),
+    ("restore", "restore the active provider's default reasoning model"),
+    ("toolcall", "manage toolcall model for the active provider"),
+)
+_SET_USAGE = "/model set <provider> [model] [--toolcall-model <model>]"
 
 
 def _provider_menu_choices() -> list[tuple[str, str]]:
@@ -244,18 +256,10 @@ def _interactive_set_toolcall(console: Console) -> bool | None:
 
 def _interactive_model_menu(session: Session, console: Console) -> bool:
     while True:
-        action = repl_choose_one(
-            title="Select Model and Effort",
-            breadcrumb=f"{_ROOT}",
-            choices=[
-                ("show", "show"),
-                ("set", "set"),
-                ("restore", "restore"),
-                ("toolcall", "toolcall"),
-                ("done", "done"),
-            ],
-        )
-        if action is None or action == "done":
+        # Same catalog the composer tray lists, so bare ``/model`` and a typed
+        # ``/model `` show one set of subcommands with one set of descriptions.
+        action = repl_choose_subcommand(parent=_ROOT, options=_MODEL_FIRST_ARGS)
+        if action is None:
             return True
         if action == "show":
             repl_section_break(console)
@@ -325,6 +329,28 @@ def parse_model_set_args(args: list[str]) -> tuple[str, str | None, str | None]:
     return provider, reasoning_model, toolcall_model
 
 
+def _set_without_provider(session: Session, console: Console) -> bool:
+    """``/model set`` alone: the provider picker when the turn owns stdin, else the ids.
+
+    An account-managed shell refuses first, as it does every switch. Without
+    exclusive stdin (agent ``slash_invoke``) the picker would race the live
+    prompt, so the valid provider ids are printed instead.
+    """
+    if _account_model_change_is_locked(console):
+        session.mark_latest(ok=False, kind="slash")
+        return True
+    if repl_tty_interactive() and exclusive_stdin_active(session):
+        if _interactive_set_provider(console) is False:
+            session.mark_latest(ok=False, kind="slash")
+        return True
+    from surfaces.shared.llm_setup.catalog import PROVIDER_BY_VALUE
+
+    console.print(f"[{DIM}]usage:[/] {escape(_SET_USAGE)}")
+    print_valid_choice_list(console, title="valid providers:", choices=sorted(PROVIDER_BY_VALUE))
+    session.mark_latest(ok=False, kind="slash")
+    return True
+
+
 def _cmd_model(session: Session, console: Console, args: list[str]) -> bool:
     if not args and repl_tty_interactive():
         # User-typed bare ``/model`` reserves exclusive stdin and opens the
@@ -332,8 +358,6 @@ def _cmd_model(session: Session, console: Console, args: list[str]) -> bool:
         # the picker against the live prompt races CPR into the composer and
         # stalls SessionGoal turns (shell-load dogfood H3). Show settings
         # instead; interactive switch stays on typed ``/model`` or ``/model set``.
-        from core.agent_harness.spi.session_state import exclusive_stdin_active
-
         if exclusive_stdin_active(session):
             return _interactive_model_menu(session, console)
         render_current_models(console)
@@ -349,11 +373,14 @@ def _cmd_model(session: Session, console: Console, args: list[str]) -> bool:
         if len(args) >= 2 and args[1].lower() == "show":
             render_current_models(console)
             return True
-        if len(args) >= 2 and args[1].lower() in ("set", "use", "switch"):
-            if len(args) < 3:
-                console.print(f"[{DIM}]usage:[/] /model toolcall set <model>")
-                return True
+        if len(args) >= 3 and args[1].lower() in ("set", "use", "switch"):
             switch_toolcall_model(args[2], console)
+            return True
+        # No model named. A turn that owns stdin collects one the way the menu
+        # does, so "/model toolcall" asks instead of printing usage and closing.
+        if repl_tty_interactive() and exclusive_stdin_active(session):
+            if _interactive_set_toolcall(console) is False:
+                session.mark_latest(ok=False, kind="slash")
             return True
         console.print(
             f"[{DIM}]usage:[/] /model toolcall set <model> "
@@ -373,15 +400,15 @@ def _cmd_model(session: Session, console: Console, args: list[str]) -> bool:
         return True
 
     if sub in ("set", "use", "switch"):
+        if len(args) == 1:
+            return _set_without_provider(session, console)
         try:
             provider_name, reasoning_model, tc_model = parse_model_set_args(args[1:])
         except ValueError as exc:
             console.print()
             console.print(f"[{ERROR}]{escape(str(exc))}[/]")
             console.print()
-            console.print(
-                f"[{DIM}]usage:[/] /model set <provider> [model] [--toolcall-model <model>]"
-            )
+            console.print(f"[{DIM}]usage:[/] {escape(_SET_USAGE)}")
             session.mark_latest(ok=False, kind="slash")
             return True
         from surfaces.shared.llm_setup.catalog import PROVIDER_BY_VALUE
@@ -391,9 +418,7 @@ def _cmd_model(session: Session, console: Console, args: list[str]) -> bool:
                 console.print()
                 console.print(f"[{ERROR}]--toolcall-model requires an explicit provider[/]")
                 console.print()
-                console.print(
-                    f"[{DIM}]usage:[/] /model set <provider> [model] [--toolcall-model <model>]"
-                )
+                console.print(f"[{DIM}]usage:[/] {escape(_SET_USAGE)}")
                 session.mark_latest(ok=False, kind="slash")
                 return True
             model_value = (
@@ -422,13 +447,6 @@ def _cmd_model(session: Session, console: Console, args: list[str]) -> bool:
     )
     return True
 
-
-_MODEL_FIRST_ARGS: tuple[tuple[str, str], ...] = (
-    ("show", "show active provider and models"),
-    ("set", "switch provider  ·  /model set <provider> [model]"),
-    ("restore", "restore the active provider's default reasoning model"),
-    ("toolcall", "manage toolcall model for the active provider"),
-)
 
 COMMANDS: list[SlashCommand] = [
     SlashCommand(
